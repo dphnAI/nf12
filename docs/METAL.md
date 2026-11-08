@@ -58,15 +58,20 @@ cmake --build build/metal   # build/metal/{nf12.metallib,libnf12_mps.dylib,_mlx_
 PyTorch and fail with undefined `std::length_error` symbols; unset them for the build.
 
 Neither framework has a stable ABI for this, so each extension is built against one
-version. The torch library uses MPS stream internals; rebuild after upgrading torch
-(the JIT cache key includes the torch version). The MLX module records the MLX
-version it was built with (`nf12._mlx_ext.mlx_version`). When the installed MLX
-differs, `nf12.mlx` builds a matching module in the JIT cache
-(`~/.cache/nf12/<key>/build`, MLX-only, without torch) on first use. That needs the
-nanobind version the installed MLX uses: MLX's bindings share nanobind state, and so
-accept `mx.array` arguments, only with the same nanobind ABI. The wheel's build
-requirements pin MLX 0.32.4 with nanobind 3.1.0. A macOS wheel is CPython specific
-because of the MLX module.
+version and records it. When the installed version differs, nf12 builds a matching
+copy in the JIT cache (`~/.cache/nf12/<key>/build`) on first use:
+
+- The torch library uses MPS stream internals. CMake writes the torch version next to
+  it (`libnf12_mps.torch_version`), and the loader uses a packaged copy only under that
+  torch. CUDA's `libnf12_torch.so` uses the torch stable ABI and needs no such check.
+- The MLX module records its MLX version (`nf12._mlx_ext.mlx_version`); the MLX
+  rebuild is MLX-only and does not need torch. It needs the nanobind version the
+  installed MLX uses: MLX's bindings share nanobind state, and so accept `mx.array`
+  arguments, only with the same nanobind ABI. `nf12.mlx` checks this when it loads
+  the module and names the mismatch instead of failing every call. The wheel's build
+  requirements pin MLX 0.32.4 with nanobind 3.1.0.
+
+A macOS wheel is CPython specific because of the MLX module.
 
 ## Layout
 
@@ -193,6 +198,7 @@ small-T MoE path still has headroom; see below.
 - `moe_linear` supports up to 1024 experts (as on CUDA); `moe_align` supports any count.
 - The C API (`include/nf12/nf12.h`) and CUDA graphs are CUDA only.
 - MLX: ops have no `vjp`/`vmap` (inference only) and run on the GPU stream only.
-  The `mlx.nn` modules are built with `from_linear`, `from_embedding` or
-  `from_weight` (escape counts vary per weight, so `load_weights` into a fresh
-  module's shapes does not apply). The package still depends on PyTorch.
+  The `mlx.nn` modules work under `mx.compile` with their state captured: a dense
+  weight's `exp_base` reaches the kernels as an array, so a reused trace stays correct
+  after the weight is replaced. Their `load_weights` accepts NF12 checkpoints, whose
+  escape counts differ per weight. The package still depends on PyTorch.

@@ -10,6 +10,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "launch.h"
@@ -154,6 +156,8 @@ std::string shape_str(const array& a) {
 void check_shape(int64_t n, int64_t k, const char* what) {
   if (n <= 0 || n % 16 != 0) fail("nf12: ", what, " needs N (out_features) to be a positive multiple of 16, got ", n);
   if (k <= 0 || k % 64 != 0) fail("nf12: ", what, " needs K (in_features) to be a positive multiple of 64, got ", k);
+  // bf16t rows are 2K bytes: every dimension must fit MLX's int32 shapes.
+  if (2 * k > INT32_MAX) fail("nf12: ", what, " K (", k, ") is too large for MLX's int32 dimensions");
 }
 
 array check_weight_matrix(const array& w, const char* op) {
@@ -162,22 +166,61 @@ array check_weight_matrix(const array& w, const char* op) {
   return contig(w);
 }
 
+// A dense exponent base: a Python int, or a uint8 array whose element 0 is the
+// base (e.g. an nn.Module's nf12_exp_base). Arrays are graph inputs, so a
+// compiled function stays correct when the weight it captured is replaced.
+using ExpBaseArg = std::variant<int64_t, array>;
+
 struct WeightView {
   array packed, escapes;
   int64_t n, k, num_escapes;
-  uint32_t exp_base;
-  const array* escapes_or_null() const { return num_escapes > 0 ? &escapes : nullptr; }
+  uint32_t exp_base;              // when base_array is empty
+  optional<array> base_array;     // uint8 [1]
 };
 
-WeightView weight_view(const array& packed, const array& escapes, int64_t exp_base) {
+// Adds the weight's optional inputs (escapes, exp_base array) to `inputs` and
+// records where they are, for the launch inside eval_gpu.
+struct WeightInputs {
+  int esc = -1, base = -1;
+  uint32_t value = 0;
+  const array* escapes(const std::vector<array>& in) const { return esc >= 0 ? &in[esc] : nullptr; }
+  ExpBase<MlxEncoder> exp_base(const std::vector<array>& in) const {
+    return base >= 0 ? ExpBase<MlxEncoder>{&in[base], 0} : ExpBase<MlxEncoder>{nullptr, value};
+  }
+};
+
+WeightInputs add_weight_inputs(const WeightView& w, std::vector<array>& inputs) {
+  WeightInputs r;
+  r.value = w.exp_base;
+  if (w.num_escapes > 0) {
+    r.esc = int(inputs.size());
+    inputs.push_back(w.escapes);
+  }
+  if (w.base_array) {
+    r.base = int(inputs.size());
+    inputs.push_back(*w.base_array);
+  }
+  return r;
+}
+
+WeightView weight_view(const array& packed, const array& escapes, const ExpBaseArg& exp_base_arg) {
   if (packed.dtype() != mx::uint8 || packed.ndim() != 2) fail("nf12: packed must be a uint8 [N, K*3/2] array");
   if (packed.shape(1) % 3 != 0) fail("nf12: packed row length must be K*3/2, got ", packed.shape(1));
   if (escapes.dtype() != mx::int16 || escapes.ndim() != 2 || escapes.shape(1) != 8)
     fail("nf12: escapes must be an int16 [E, 8] array");
-  if (exp_base < 0 || exp_base > kMaxExpBase) fail("nf12: exp_base must be in [0, 120], got ", exp_base);
+  uint32_t exp_base = 0;
+  optional<array> base_array;
+  if (const int64_t* v = std::get_if<int64_t>(&exp_base_arg)) {
+    if (*v < 0 || *v > kMaxExpBase) fail("nf12: exp_base must be in [0, 120], got ", *v);
+    exp_base = uint32_t(*v);
+  } else {
+    const array& b = std::get<array>(exp_base_arg);
+    if (b.dtype() != mx::uint8 || b.size() != 1) fail("nf12: an exp_base array must be uint8 with one element");
+    base_array = contig(mx::reshape(b, {1}, gpu_stream()));
+  }
   const int64_t n = packed.shape(0), k = int64_t(packed.shape(1)) / 3 * 2;
   check_shape(n, k, "packed weight");
-  return {contig(packed), contig(escapes), n, k, int64_t(escapes.shape(0)), uint32_t(exp_base)};
+  return {contig(packed), contig(escapes), n, k, int64_t(escapes.shape(0)), exp_base, base_array};
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +246,7 @@ std::pair<array, array> encode_matrix(const array& w, int64_t n, int64_t k, uint
                          });
   const mx::Stream s = gpu_stream();
   array offsets = mx::cumsum(mx::astype(counts, mx::int64, s), /*reverse=*/false, /*inclusive=*/false, s);
+  if (count > uint64_t(INT32_MAX)) fail("nf12.encode: ", count, " escaped groups exceed MLX's int32 dimensions");
   // The write pass places escapes at these offsets: check the total against
   // the analysis before sizing the escape buffer (encoding synchronizes anyway).
   array total = mx::add(mx::slice(offsets, {-1}, {int(offsets.size())}, s),
@@ -228,19 +272,16 @@ std::tuple<array, array, int64_t> encode(const array& w_in) {
 }
 
 array decode_view(const WeightView& w) {
-  const bool has_esc = w.num_escapes > 0;
   std::vector<array> inputs{w.packed};
-  if (has_esc) inputs.push_back(w.escapes);
+  const WeightInputs wi = add_weight_inputs(w, inputs);
   const int64_t n = w.n, k = w.k;
-  const uint32_t base = w.exp_base;
   return kernel1("decode", {int(n), int(k)}, mx::bfloat16, std::move(inputs),
                  [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& out) {
-                   launch_decode(e, in[0], has_esc ? &in[1] : nullptr, nullptr, nullptr, base, 1, n, k, out[0],
-                                 uint64_t(k));
+                   launch_decode(e, in[0], wi.escapes(in), nullptr, wi.exp_base(in), 1, n, k, out[0], uint64_t(k));
                  });
 }
 
-array decode(const array& packed, const array& escapes, int64_t exp_base) {
+array decode(const array& packed, const array& escapes, const ExpBaseArg& exp_base) {
   return decode_view(weight_view(packed, escapes, exp_base));
 }
 
@@ -253,7 +294,7 @@ array pack_bf16t(const array& w_in) {
                  });
 }
 
-array embedding(const array& ids_in, const array& packed, const array& escapes, int64_t exp_base) {
+array embedding(const array& ids_in, const array& packed, const array& escapes, const ExpBaseArg& exp_base) {
   const WeightView w = weight_view(packed, escapes, exp_base);
   if (ids_in.dtype() != mx::int32 && ids_in.dtype() != mx::int64)
     fail("nf12.embedding: ids must be an int32 or int64 array");
@@ -261,17 +302,16 @@ array embedding(const array& ids_in, const array& packed, const array& escapes, 
   shape.push_back(int(w.k));
   const int64_t num_ids = int64_t(ids_in.size());
   if (num_ids == 0) return mx::zeros(shape, mx::bfloat16, gpu_stream());
-  if (num_ids > int64_t(UINT32_MAX)) fail("nf12.embedding: too many ids");
+  if (num_ids > int64_t(INT32_MAX)) fail("nf12.embedding: more than 2^31 - 1 ids");  // MLX dimensions are int32
   const array ids = contig(mx::reshape(ids_in, {int(num_ids)}, gpu_stream()));
-  const bool ids64 = ids_in.dtype() == mx::int64, has_esc = w.num_escapes > 0;
+  const bool ids64 = ids_in.dtype() == mx::int64;
   std::vector<array> inputs{w.packed, ids};
-  if (has_esc) inputs.push_back(w.escapes);
+  const WeightInputs wi = add_weight_inputs(w, inputs);
   const int64_t n = w.n, k = w.k;
-  const uint32_t base = w.exp_base;
   array out = kernel1("embedding", {int(num_ids), int(k)}, mx::bfloat16, std::move(inputs),
                       [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& o) {
-                        launch_embedding(e, in[0], has_esc ? &in[2] : nullptr, base, in[1], ids64, uint64_t(num_ids),
-                                         n, k, o[0]);
+                        launch_embedding(e, in[0], wi.escapes(in), wi.exp_base(in), in[1], ids64, uint64_t(num_ids), n,
+                                         k, o[0]);
                       });
   return mx::reshape(out, shape, gpu_stream());
 }
@@ -306,21 +346,22 @@ array run_linear(const array& x, const array& packed, int64_t n, int64_t k, cons
       return bias ? mx::addmm(*bias, x2, wt, 1.0f, 1.0f, s) : mx::matmul(x2, wt, s);
     }
     std::vector<array> inputs{x2, packed};
-    const bool has_esc = nf12 && nf12_view->num_escapes > 0, has_bias = bias.has_value();
-    if (has_esc) inputs.push_back(nf12_view->escapes);
-    if (has_bias) inputs.push_back(*bias);
-    const int esc_i = has_esc ? 2 : -1, bias_i = has_bias ? (has_esc ? 3 : 2) : -1;
-    const uint32_t base = nf12 ? nf12_view->exp_base : 0;
+    const WeightInputs wi = nf12 ? add_weight_inputs(*nf12_view, inputs) : WeightInputs{};
+    int bias_i = -1;
+    if (bias) {
+      bias_i = int(inputs.size());
+      inputs.push_back(*bias);
+    }
     return kernel1(nf12 ? "linear" : "linear_bf16t", {int(m), int(n)}, mx::bfloat16, std::move(inputs),
                    [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& out) {
-                     launch_linear(e, route, in[0], uint64_t(k), in[1], nf12, esc_i >= 0 ? &in[esc_i] : nullptr, base,
+                     launch_linear(e, route, in[0], uint64_t(k), in[1], nf12, wi.escapes(in), wi.exp_base(in),
                                    bias_i >= 0 ? &in[bias_i] : nullptr, out[0], m, n, k);
                    });
   }();
   return mx::reshape(y, out_shape, s);
 }
 
-array linear(const array& x, const array& packed, const array& escapes, int64_t exp_base,
+array linear(const array& x, const array& packed, const array& escapes, const ExpBaseArg& exp_base,
              const optional<array>& bias) {
   const WeightView w = weight_view(packed, escapes, exp_base);
   return run_linear(x, w.packed, w.n, w.k, bias, "linear", &w);
@@ -400,7 +441,10 @@ std::tuple<array, array> moe_align(const array& topk_ids_in, int64_t num_experts
     return {mx::astype(order, mx::int32, s), offsets};
   }
   const uint32_t a32 = uint32_t(a), e32 = uint32_t(num_experts);
-  auto outs = kernel("moe_align", {{a}, {int(num_experts) + 1}, {int(align_scratch_words(a32, e32))}},
+  // Scratch is [chunks, E] (at least one word): each dimension fits MLX's int32
+  // shapes even when the 64-bit word count (align_scratch_words) does not.
+  const mx::Shape scratch = {int(std::max<uint64_t>(1, align_chunks(a32))), int(num_experts)};
+  auto outs = kernel("moe_align", {{a}, {int(num_experts) + 1}, scratch},
                      {mx::int32, mx::int64, mx::uint32}, {ids},
                      [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& out) {
                        launch_moe_align(e, in[0], a32, e32, out[2], out[0], out[1]);
@@ -434,7 +478,9 @@ array run_moe_linear(const array& x_in, const MoeWeight& w, const array& expert_
   const MoeRoute route = moe_route(a, w.experts);
   const uint32_t e32 = uint32_t(w.experts), a32 = uint32_t(a);
   const array schedule =
-      kernel1("moe_schedule", {int(moe_schedule_ints(a, w.experts, route.bm))}, mx::int32, {offsets},
+      // [1 + max_tiles, 4] int32 (the flat int4 layout launch_moe_schedule writes): a flat
+      // dimension of 4 * (1 + max_tiles) would overflow MLX's int32 shapes for large A.
+      kernel1("moe_schedule", {int(moe_schedule_ints(a, w.experts, route.bm) / 4), 4}, mx::int32, {offsets},
               [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& out) {
                 launch_moe_schedule(e, in[0], e32, a32, route.bm, out[0]);
               });
@@ -483,7 +529,7 @@ array moe_decode(const array& packed, const array& escapes, const array& escape_
   const int64_t experts = w.experts, n = w.n, k = w.k;
   return kernel1("moe_decode", {int(experts), int(n), int(k)}, mx::bfloat16, std::move(inputs),
                  [=](MlxEncoder& e, const std::vector<array>& in, std::vector<array>& out) {
-                   launch_decode(e, in[0], has_esc ? &in[3] : nullptr, &in[1], &in[2], 0, experts, n, k, out[0],
+                   launch_decode(e, in[0], has_esc ? &in[3] : nullptr, &in[1], ExpBase<MlxEncoder>{&in[2], 0}, experts, n, k, out[0],
                                  uint64_t(k));
                  });
 }
@@ -582,6 +628,9 @@ NB_MODULE(_mlx_ext, m) {
   using namespace nf12_mlx;
   m.doc() = "NF12 kernels for MLX arrays (see nf12.mlx)";
   m.attr("mlx_version") = NF12_MLX_VERSION;  // the MLX this module was built against
+  // nf12.mlx calls this once: it raises TypeError if this module's nanobind ABI
+  // differs from MLX's, so mx.array arguments would never convert.
+  m.def("_accepts_array", [](const array&) { return true; });
   m.def("encode", &encode, "w"_a);
   m.def("decode", &decode, "packed"_a, "escapes"_a, "exp_base"_a);
   m.def("pack_bf16t", &pack_bf16t, "w"_a);

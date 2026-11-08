@@ -55,6 +55,14 @@ def _load():
             ext = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(ext)
             sys.modules["nf12._mlx_ext"] = ext
+        try:
+            ext._accepts_array(mx.array(0))
+        except TypeError as error:
+            raise ImportError(
+                f"nf12: {ext.__file__} cannot take mx.array arguments: it was built with a different nanobind "
+                f"ABI than MLX {mx.__version__}. Install the nanobind version MLX was built with and rebuild "
+                "(clear ~/.cache/nf12 for a first-use build)."
+            ) from error
         _ext = ext
         return _ext
 
@@ -398,19 +406,65 @@ class _NF12WeightModule(nn.Module):
 
     def _assign_weight(self, weight: NF12Weight) -> None:
         self.weight = weight.state_dict()
-        # A plain attribute (tuples set on an nn.Module join its parameter tree).
-        object.__setattr__(self, "_cache", (tuple(self.weight.values()), weight))
+        # exp_base is also kept as a Python int (a plain attribute, outside the
+        # parameter tree), so calls never evaluate an array: that works under
+        # mx.compile, where the arrays are placeholders.
+        object.__setattr__(self, "_exp_base", weight.exp_base)
         self.freeze()
+
+    def update(self, parameters: dict, strict: bool = True) -> nn.Module:
+        """``nn.Module.update`` (also used by ``load_weights``); re-reads exp_base
+        (one sync) when the weight is replaced."""
+        super().update(parameters, strict)
+        if "weight" in parameters:
+            object.__setattr__(self, "_exp_base", NF12Weight.from_state_dict(self.weight).exp_base)
+        return self
+
+    def load_weights(self, file_or_weights, strict: bool = True) -> nn.Module:
+        """``nn.Module.load_weights`` for NF12 checkpoints (e.g. from ``mx.save_safetensors``).
+
+        The escape count differs per weight, so ``weight.*`` arrays are checked
+        as an NF12 weight of this module's shape rather than against the current
+        array shapes. Other arrays (``bias``) must match their current shapes.
+        ``strict`` requires exactly this module's keys."""
+        from mlx.utils import tree_flatten
+
+        weights = dict(mx.load(file_or_weights) if isinstance(file_or_weights, str) else file_or_weights)
+        current = dict(tree_flatten(self.parameters()))
+        if strict and set(weights) != set(current):
+            missing, extra = sorted(set(current) - set(weights)), sorted(set(weights) - set(current))
+            raise ValueError(f"nf12: checkpoint keys do not match the module (missing {missing}, unexpected {extra})")
+        prefix = "weight."
+        nf12 = {key[len(prefix):]: value for key, value in weights.items() if key.startswith(prefix)}
+        if nf12:
+            weight = NF12Weight.from_state_dict(nf12)
+            if weight.shape != self.nf12_weight.shape:
+                raise ValueError(f"nf12: checkpoint weight shape {weight.shape} != module shape {self.nf12_weight.shape}")
+        rest = {key: value for key, value in weights.items() if not key.startswith(prefix) and key in current}
+        for key, value in rest.items():
+            if value.shape != current[key].shape:
+                raise ValueError(f"nf12: {key} has shape {tuple(value.shape)}, expected {tuple(current[key].shape)}")
+        update = {**rest}
+        if nf12:
+            update["weight"] = nf12
+        self.update(update)
+        return self
 
     @property
     def nf12_weight(self) -> NF12Weight:
-        """The current weight; re-read (one sync for exp_base) after ``update`` or ``load_weights``."""
-        arrays, weight = self._cache
-        current = tuple(self.weight.values())
-        if any(a is not b for a, b in zip(arrays, current)):
-            weight = NF12Weight.from_state_dict(self.weight)
-            object.__setattr__(self, "_cache", (current, weight))
-        return weight
+        """The current weight, from the module's arrays and the cached exp_base."""
+        return NF12Weight(self.weight[PACKED_KEY], self.weight[ESCAPES_KEY], self._exp_base)
+
+    def _weight_args(self) -> tuple[mx.array, mx.array, mx.array]:
+        # The exp_base array (not the cached int) goes to the kernels as data, so
+        # an mx.compile trace that captured this module's state stays correct
+        # after its weight is replaced by one of the same shape.
+        w = self.weight
+        return w[PACKED_KEY], w[ESCAPES_KEY], w[EXP_BASE_KEY]
+
+    def _linear(self, x: mx.array, bias: mx.array | None) -> mx.array:
+        _check_input(x, self.nf12_weight.shape[1])
+        return _load().linear(x, *self._weight_args(), bias)
 
 
 class NF12Linear(_NF12WeightModule):
@@ -443,7 +497,7 @@ class NF12Linear(_NF12WeightModule):
         return cls.from_weight(encode(w), linear.get("bias"))
 
     def __call__(self, x: mx.array) -> mx.array:
-        return linear(x, self.nf12_weight, self.get("bias"))
+        return self._linear(x, self.get("bias"))
 
 
 class NF12Embedding(_NF12WeightModule):
@@ -468,8 +522,11 @@ class NF12Embedding(_NF12WeightModule):
         return cls.from_weight(encode(w))
 
     def __call__(self, ids: mx.array) -> mx.array:
-        return embedding(ids, self.nf12_weight)
+        _check_array(ids, "ids")
+        if ids.dtype not in (mx.int32, mx.int64):
+            raise ValueError(f"nf12: ids must be int32 or int64, got {ids.dtype}")
+        return _load().embedding(ids, *self._weight_args())
 
     def as_linear(self, x: mx.array) -> mx.array:
         """``x @ W.T`` with the table as a tied output projection."""
-        return linear(x, self.nf12_weight)
+        return self._linear(x, None)

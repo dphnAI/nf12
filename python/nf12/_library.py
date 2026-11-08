@@ -22,8 +22,25 @@ _loaded = False
 METAL = sys.platform == "darwin"
 TORCH_LIBRARY = "libnf12_mps.dylib" if METAL else "libnf12_torch.so"
 # Files that must sit next to each torch library.
-_COMPANIONS = {"libnf12_torch.so": ("libnf12.so",), "libnf12_mps.dylib": ("nf12.metallib",)}
+_COMPANIONS = {"libnf12_torch.so": ("libnf12.so",),
+               "libnf12_mps.dylib": ("nf12.metallib", "libnf12_mps.torch_version")}
 _NATIVE = {"libnf12.so", "libnf12_torch.so", "libnf12_mps.dylib", "nf12.metallib"}
+
+
+def built_for_this_torch(library: Path) -> bool:
+    """Whether a packaged ``libnf12_mps.dylib`` was built against the running torch.
+
+    It uses PyTorch's MPS internals, which have no stable ABI, so CMake records
+    the build's torch version next to it. ``libnf12_torch.so`` (CUDA) uses the
+    torch stable ABI and loads under any torch >= 2.10, so it is not checked.
+    """
+    if library.name != "libnf12_mps.dylib":
+        return True
+    try:
+        built = library.with_name("libnf12_mps.torch_version").read_text().strip()
+    except OSError:
+        return False
+    return built == torch.__version__
 
 
 def library_path(name: str = "libnf12.so") -> Path:
@@ -36,6 +53,8 @@ def library_path(name: str = "libnf12.so") -> Path:
         if candidate.is_file():
             if not all(candidate.with_name(c).is_file() for c in _COMPANIONS.get(name, ())):
                 continue
+            if not built_for_this_torch(candidate):
+                continue  # built for another torch: use (or build) the JIT copy instead
             return candidate
     if name in _NATIVE:
         from ._jit import library_directory

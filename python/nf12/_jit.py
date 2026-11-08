@@ -17,7 +17,8 @@ import threading
 from pathlib import Path
 
 _METAL = sys.platform == "darwin"
-_LIBRARIES = ("libnf12_mps.dylib", "nf12.metallib") if _METAL else ("libnf12.so", "libnf12_torch.so")
+_LIBRARIES = (("libnf12_mps.dylib", "nf12.metallib", "libnf12_mps.torch_version") if _METAL
+              else ("libnf12.so", "libnf12_torch.so"))
 # The MLX extension is a CPython module built against one MLX version.
 _MLX_LIBRARIES = ("_mlx_ext" + (sysconfig.get_config_var("EXT_SUFFIX") or ".so"), "nf12.metallib")
 _BUILD_ENV = (
@@ -210,7 +211,13 @@ def mlx_library_directory() -> Path:
 
     with _lock:
         if _mlx_directory is None:
-            identity = {"backend": "mlx", "mlx": mx.__version__,
+            try:  # the module must share MLX's nanobind ABI, so the build depends on it too
+                from importlib.metadata import version
+
+                nanobind = version("nanobind")
+            except Exception:
+                nanobind = None
+            identity = {"backend": "mlx", "mlx": mx.__version__, "nanobind": nanobind,
                         "mlx_path": str(Path(mx.__file__).resolve().parent)}
             _mlx_directory = _cached_build(identity, _MLX_LIBRARIES,
                                            lambda source, directory: _build_metal(source, directory, mlx=True))

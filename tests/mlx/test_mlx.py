@@ -394,3 +394,74 @@ def test_weights_move_between_frameworks():
 def test_import_does_not_need_torch():
     code = "import sys, nf12.mlx; assert 'torch' not in sys.modules, sorted(m for m in sys.modules if 'torch' in m)"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# --- mx.compile, weight replacement, checkpoints --------------------------------
+
+def test_compile_with_captured_state():
+    layer = nm.NF12Linear(64, 16, bias=False)
+    compiled = mx.compile(lambda x: layer(x), inputs=layer.state)
+    assert_bitwise(compiled(mx.ones((1, 64), dtype=mx.bfloat16)), mx.zeros((1, 16), dtype=mx.bfloat16))
+
+
+def same_shape_weights(n: int, k: int) -> tuple[nm.NF12Weight, nm.NF12Weight]:
+    """Two encodings with equal array shapes (no escapes) but different exp_base."""
+    w = randn(n, k, seed=21, scale=0.02)
+    a, b = nm.encode(to_mlx(w)), nm.encode(to_mlx(w * 16))
+    assert a.num_escapes == b.num_escapes == 0 and a.exp_base != b.exp_base
+    return a, b
+
+
+@pytest.mark.parametrize("route", ["small", "mma", "gemm", "decode"])
+def test_compile_follows_weight_replacement(monkeypatch, route):
+    """exp_base is graph data: a trace reused after update() (same shapes, so no
+    retrace) must use the new base, not one baked in at trace time."""
+    monkeypatch.setenv("NF12_MPS_LINEAR", route)
+    a, b = same_shape_weights(48, 128)
+    layer = nm.NF12Linear.from_weight(a)
+    f = mx.compile(lambda x: layer(x), inputs=layer.state)
+    x = activations(3, 128)
+    assert_bitwise(f(x), nm.linear(x, a))
+    layer.update({"weight": b.state_dict()})
+    assert layer.nf12_weight.exp_base == b.exp_base
+    assert_bitwise(f(x), nm.linear(x, b))
+
+    emb = nm.NF12Embedding.from_weight(a)
+    g = mx.compile(lambda i: emb(i), inputs=emb.state)
+    ids = mx.array([0, 7, 47], dtype=mx.int32)
+    assert_bitwise(g(ids), nm.embedding(ids, a))
+    emb.update({"weight": b.state_dict()})
+    assert_bitwise(g(ids), nm.embedding(ids, b))
+
+
+def test_exp_base_as_array():
+    nw = nm.encode(matrix(32, 128))
+    base = mx.array([nw.exp_base], dtype=mx.uint8)
+    x = activations(2, 128)
+    ext = nm._load()
+    assert_bitwise(ext.linear(x, nw.packed, nw.escapes, base), nm.linear(x, nw))
+    assert_bitwise(ext.decode(nw.packed, nw.escapes, base), nw.decode())
+    ids = mx.array([3, 0], dtype=mx.int32)
+    assert_bitwise(ext.embedding(ids, nw.packed, nw.escapes, base), nm.embedding(ids, nw))
+    with pytest.raises(ValueError, match="uint8 with one element"):
+        ext.linear(x, nw.packed, nw.escapes, mx.array([1, 2], dtype=mx.uint8))
+
+
+def test_load_weights_nf12_checkpoint(tmp_path):
+    import mlx.utils
+
+    mx.random.seed(2)
+    lin = mnn.Linear(128, 48)
+    lin.set_dtype(mx.bfloat16)
+    src = nm.NF12Linear.from_linear(lin)
+    path = str(tmp_path / "layer.safetensors")
+    mx.save_safetensors(path, dict(mlx.utils.tree_flatten(src.parameters())))
+    fresh = nm.NF12Linear(128, 48)  # different escape count: shapes differ from the checkpoint
+    fresh.load_weights(path)
+    x = activations(4, 128)
+    assert_bitwise(fresh(x), src(x))
+    assert fresh.nf12_weight.exp_base == src.nf12_weight.exp_base
+    with pytest.raises(ValueError, match="do not match"):
+        nm.NF12Linear(128, 48, bias=False).load_weights(path)
+    with pytest.raises(ValueError, match="shape"):
+        nm.NF12Linear(64, 48).load_weights(path)

@@ -40,7 +40,6 @@ constexpr int64_t kMoeMaxExperts = 1024;  // moe.metal kMaxExperts
 constexpr uint32_t kAlignChunk = 256;     // moe.metal kAlignChunk
 
 inline uint64_t ceil_div(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
-inline uint32_t exp_base_x4(uint32_t b) { return b * 0x01010101u; }
 inline uint64_t super_atoms(int64_t n, int64_t k) { return uint64_t(n / 16) * uint64_t(k / 64); }
 
 template <class E>
@@ -51,7 +50,7 @@ using out_ptr = std::remove_reference_t<typename E::out_t>*;
 
 struct LinearParams {  // linear.metal LinearParams
   uint64_t ldx, ldy;
-  uint32_t m, n, k_blocks, kb_per_split, row_blocks, splits, has_bias, base_x4;
+  uint32_t m, n, k_blocks, kb_per_split, row_blocks, splits, has_bias, reserved;
 };
 static_assert(sizeof(LinearParams) == 48, "LinearParams layout must match linear.metal");
 
@@ -174,15 +173,34 @@ inline std::pair<uint32_t, uint64_t> best_exp_base(const uint32_t* hist, uint64_
 // ---------------------------------------------------------------------------
 // Launches.
 
+// A dense NF12 weight's exponent base, read by the kernels from a uchar buffer:
+// either a uint8 array (MLX passes the module's array, so the base is graph
+// data and stays correct when mx.compile reuses a trace after weights change)
+// or a value bound as inline bytes (byte 0 of a little-endian uint32).
+template <class E>
+struct ExpBase {
+  const typename E::tensor* array = nullptr;  // uint8, element 0 is the base
+  uint32_t value = 0;
+};
+
+template <class E>
+void bind_exp_base(E& e, const ExpBase<E>& b, int index) {
+  if (b.array != nullptr) {
+    e.in(*b.array, index);
+  } else {
+    const uint32_t v = b.value;
+    e.bytes(v, index);
+  }
+}
+
 // Fills `words` 32-bit words of `buf` with `value`.
 template <class E>
 void launch_fill(E& e, typename E::out_t buf, uint64_t words, uint32_t value = 0) {
   if (words == 0) return;
-  if (words > 0xffffffffull) throw std::invalid_argument("nf12: fill of more than 2^32 - 1 words");
-  const uint32_t count = uint32_t(words);
+  if (ceil_div(words, 256) > 0xffffffffull) throw std::invalid_argument("nf12: fill too large for one dispatch");
   e.pipeline("nf12_fill_u32");
   e.out(buf, 0);
-  e.bytes(count, 1);
+  e.bytes(words, 1);
   e.bytes(value, 2);
   e.dispatch(ceil_div(words, 256), 1, 1, 256, 1, 1);
 }
@@ -245,14 +263,13 @@ void launch_encode_write(E& e, const typename E::tensor& w, uint64_t ldw, int64_
 }
 
 // Decodes `experts` stacked weights of n rows into out [experts * n, k] (row
-// stride ldo). Stacked experts pass escape_offsets (int64 [E + 1]) and
-// exp_base (uint8 [E]); a dense weight passes null and dense_exp_base.
+// stride ldo). Stacked experts pass escape_offsets (int64 [E + 1]) and an
+// exp_base array (uint8 [E]); a dense weight passes null offsets and its base.
 // `escapes` is null when there are none.
 template <class E>
 void launch_decode(E& e, const typename E::tensor& packed, const typename E::tensor* escapes,
-                   const typename E::tensor* escape_offsets, const typename E::tensor* exp_base,
-                   uint32_t dense_exp_base, int64_t experts, int64_t n, int64_t k, typename E::out_t out,
-                   uint64_t ldo) {
+                   const typename E::tensor* escape_offsets, const ExpBase<E>& exp_base, int64_t experts, int64_t n,
+                   int64_t k, typename E::out_t out, uint64_t ldo) {
   const uint64_t num_sa = super_atoms(n, k);
   const uint32_t k_blocks = uint32_t(k / 64);
   const uint64_t rows = uint64_t(n);
@@ -261,13 +278,11 @@ void launch_decode(E& e, const typename E::tensor& packed, const typename E::ten
   e.in(escapes != nullptr ? *escapes : packed, 1);
   if (escape_offsets != nullptr) {
     e.in(*escape_offsets, 2);
-    e.in(*exp_base, 3);
   } else {
     const int64_t zero = 0;
-    const uint32_t base = dense_exp_base;  // little endian: byte 0 is expert 0's base
     e.bytes(zero, 2);
-    e.bytes(base, 3);
   }
+  bind_exp_base(e, exp_base, 3);
   e.bytes(num_sa, 4);
   e.bytes(k_blocks, 5);
   e.bytes(ldo, 6);
@@ -291,11 +306,10 @@ void launch_pack_bf16t(E& e, const typename E::tensor& w, uint64_t ldw, int64_t 
 
 // ids: contiguous int32 (ids64 = false) or int64; out [num_ids, k] bf16.
 template <class E>
-void launch_embedding(E& e, const typename E::tensor& packed, const typename E::tensor* escapes, uint32_t exp_base,
+void launch_embedding(E& e, const typename E::tensor& packed, const typename E::tensor* escapes, const ExpBase<E>& exp_base,
                       const typename E::tensor& ids, bool ids64, uint64_t num_ids, int64_t n, int64_t k,
                       typename E::out_t out) {
   if (num_ids > 0xffffffffull) throw std::invalid_argument("nf12.embedding: too many ids");
-  const uint32_t base_x4 = exp_base_x4(exp_base);
   const uint64_t vocab = uint64_t(n), ldo = uint64_t(k);
   const uint32_t k_blocks = uint32_t(k / 64);
   // 64 threads per threadgroup along x covers 4 super-atom columns.
@@ -304,7 +318,7 @@ void launch_embedding(E& e, const typename E::tensor& packed, const typename E::
   e.pipeline(ids64 ? "nf12_embedding_i64" : "nf12_embedding_i32");
   e.in(packed, 0);
   e.in(escapes != nullptr ? *escapes : packed, 1);
-  e.bytes(base_x4, 2);
+  bind_exp_base(e, exp_base, 2);
   e.in(ids, 3);
   e.bytes(vocab, 4);
   e.bytes(k_blocks, 5);
@@ -319,7 +333,7 @@ void launch_embedding(E& e, const typename E::tensor& packed, const typename E::
 // bf16t twins pass `nf12 = false`.
 template <class E>
 void launch_linear(E& e, Route route, const typename E::tensor& x, uint64_t ldx, const typename E::tensor& packed,
-                   bool nf12, const typename E::tensor* escapes, uint32_t exp_base, const typename E::tensor* bias,
+                   bool nf12, const typename E::tensor* escapes, const ExpBase<E>& exp_base, const typename E::tensor* bias,
                    typename E::out_t y, int64_t m, int64_t n, int64_t k) {
   if (route == Route::kDecode) throw std::invalid_argument("nf12: launch_linear does not run decode-then-GEMM");
   LinearParams p{};
@@ -329,7 +343,6 @@ void launch_linear(E& e, Route route, const typename E::tensor& x, uint64_t ldx,
   p.n = uint32_t(n);
   p.k_blocks = uint32_t(k / 64);
   p.has_bias = bias != nullptr ? 1u : 0u;
-  p.base_x4 = nf12 ? exp_base_x4(exp_base) : 0u;
   const std::string src = nf12 ? "nf12" : "bf16t";
   std::string kernel;
   uint64_t gx, gy, threads;
@@ -363,6 +376,7 @@ void launch_linear(E& e, Route route, const typename E::tensor& x, uint64_t ldx,
   e.in(bias != nullptr ? *bias : x, 3);
   e.out(y, 4);
   e.bytes(p, 5);
+  if (nf12) bind_exp_base(e, exp_base, 6);
   e.dispatch(gx, gy, 1, threads, 1, 1);
 }
 
@@ -396,8 +410,12 @@ void launch_moe_align(E& e, const typename E::tensor& ids, uint32_t a, uint32_t 
   e.dispatch(chunks, 1, 1, kAlignChunk, 1, 1);
 }
 
-inline uint32_t align_scratch_words(uint32_t a, uint32_t num_experts) {
-  return std::max<uint32_t>(1, uint32_t(ceil_div(a, kAlignChunk)) * num_experts);
+// Scratch for launch_moe_align: one uint32 per (chunk, expert). The count
+// exceeds 32 bits for large A and E (chunks < 2^23, E <= 1024), so it is 64-bit;
+// the kernels index it with 64-bit arithmetic.
+inline uint64_t align_chunks(uint32_t a) { return ceil_div(a, kAlignChunk); }
+inline uint64_t align_scratch_words(uint32_t a, uint32_t num_experts) {
+  return std::max<uint64_t>(1, align_chunks(a) * num_experts);
 }
 
 // Tile schedule for moe_linear: int32 [4 * (1 + max_tiles)].

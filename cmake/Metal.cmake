@@ -108,11 +108,14 @@ if(NOT NF12_BUILD_TORCH)
 endif()
 
 execute_process(
-  COMMAND "${Python_EXECUTABLE}" -c "import os, torch; print(os.path.dirname(torch.__file__))"
-  OUTPUT_VARIABLE NF12_TORCH_DIR
+  COMMAND "${Python_EXECUTABLE}" -c "import os, torch; print(os.path.dirname(torch.__file__)); print(torch.__version__)"
+  OUTPUT_VARIABLE _nf12_torch_probe
   OUTPUT_STRIP_TRAILING_WHITESPACE
   COMMAND_ERROR_IS_FATAL ANY)
-message(STATUS "nf12: torch at ${NF12_TORCH_DIR}")
+string(REPLACE "\n" ";" _nf12_torch_probe "${_nf12_torch_probe}")
+list(GET _nf12_torch_probe 0 NF12_TORCH_DIR)
+list(GET _nf12_torch_probe 1 NF12_TORCH_VERSION)
+message(STATUS "nf12: torch ${NF12_TORCH_VERSION} at ${NF12_TORCH_DIR}")
 # Isolated builds can locate torch in a different temporary environment each time.
 foreach(_lib torch torch_cpu c10)
   unset(NF12_TORCH_${_lib}_LIB CACHE)
@@ -136,3 +139,8 @@ set_target_properties(nf12_mps PROPERTIES
   BUILD_RPATH "${NF12_TORCH_DIR}/lib"
   INSTALL_RPATH "@loader_path/../torch/lib;${NF12_TORCH_DIR}/lib")
 install(TARGETS nf12_mps LIBRARY DESTINATION nf12)
+# The torch this library was built against: python/nf12/_library.py loads it only
+# under the same torch version and otherwise rebuilds (python/nf12/_jit.py).
+set(NF12_MPS_TORCH_VERSION_FILE "${CMAKE_CURRENT_BINARY_DIR}/libnf12_mps.torch_version")
+file(WRITE "${NF12_MPS_TORCH_VERSION_FILE}" "${NF12_TORCH_VERSION}\n")
+install(FILES "${NF12_MPS_TORCH_VERSION_FILE}" DESTINATION nf12)

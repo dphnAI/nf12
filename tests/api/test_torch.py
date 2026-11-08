@@ -382,3 +382,18 @@ def test_torch_compile_functional():
 
     x = activations(4, 256)
     assert_bitwise(f(x), nf12.linear(x, nw) * 2)
+
+
+def test_mps_library_requires_its_torch_version(tmp_path):
+    """libnf12_mps.dylib uses PyTorch internals: a packaged copy is used only under
+    the torch version recorded at build time (otherwise nf12 builds a matching one)."""
+    from nf12._library import built_for_this_torch
+
+    lib = tmp_path / "libnf12_mps.dylib"
+    lib.touch()
+    assert not built_for_this_torch(lib)  # no record
+    (tmp_path / "libnf12_mps.torch_version").write_text(torch.__version__ + "\n")
+    assert built_for_this_torch(lib)
+    (tmp_path / "libnf12_mps.torch_version").write_text("2.10.0\n" if torch.__version__ != "2.10.0" else "2.11.0\n")
+    assert not built_for_this_torch(lib)
+    assert built_for_this_torch(tmp_path / "libnf12_torch.so")  # CUDA: torch stable ABI, any torch >= 2.10

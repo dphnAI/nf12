@@ -204,33 +204,36 @@ inline void embedding_impl(device const uint* packed, device const uint4* escape
 
 kernel void nf12_embedding_i32(device const uint* packed [[buffer(0)]],
                                device const uint4* escapes [[buffer(1)]],
-                               constant uint& base_x4 [[buffer(2)]],
+                               constant uchar* exp_base [[buffer(2)]],
                                device const int* ids [[buffer(3)]],
                                constant ulong& vocab [[buffer(4)]],
                                constant uint& k_blocks [[buffer(5)]],
                                device uint* out [[buffer(6)]],
                                constant ulong& ldo [[buffer(7)]],
                                uint2 gid [[thread_position_in_grid]]) {
-  embedding_impl(packed, escapes, base_x4, ids, vocab, k_blocks, out, ldo, gid);
+  embedding_impl(packed, escapes, exp_base_x4(exp_base[0]), ids, vocab, k_blocks, out, ldo, gid);
 }
 
 kernel void nf12_embedding_i64(device const uint* packed [[buffer(0)]],
                                device const uint4* escapes [[buffer(1)]],
-                               constant uint& base_x4 [[buffer(2)]],
+                               constant uchar* exp_base [[buffer(2)]],
                                device const long* ids [[buffer(3)]],
                                constant ulong& vocab [[buffer(4)]],
                                constant uint& k_blocks [[buffer(5)]],
                                device uint* out [[buffer(6)]],
                                constant ulong& ldo [[buffer(7)]],
                                uint2 gid [[thread_position_in_grid]]) {
-  embedding_impl(packed, escapes, base_x4, ids, vocab, k_blocks, out, ldo, gid);
+  embedding_impl(packed, escapes, exp_base_x4(exp_base[0]), ids, vocab, k_blocks, out, ldo, gid);
 }
 
 // Fills `count` 32-bit words with `value`. Backends whose encoders do not zero
 // new buffers (MLX) use it for the encode histograms and zero-filled outputs.
+// 256 threads per threadgroup; the index is 64-bit, so outputs may exceed 2^32 words.
 kernel void nf12_fill_u32(device uint* out [[buffer(0)]],
-                          constant uint& count [[buffer(1)]],
+                          constant ulong& count [[buffer(1)]],
                           constant uint& value [[buffer(2)]],
-                          uint i [[thread_position_in_grid]]) {
+                          uint tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+  const ulong i = ulong(tg) * 256 + tid;
   if (i < count) out[i] = value;
 }

@@ -115,6 +115,8 @@ void run(const Body& body) {
 
 const Tensor* opt(const std::optional<Tensor>& t) { return t.has_value() ? &*t : nullptr; }
 const Tensor* nonempty(const Tensor& t) { return t.numel() > 0 ? &t : nullptr; }
+// torch.ops.nf12 takes a dense exp_base as an int, bound as inline bytes.
+using Base = ExpBase<TorchEncoder>;
 
 // ---------------------------------------------------------------------------
 // Validation (mirrors csrc/torch/ops.cpp with MPS in place of CUDA).
@@ -220,7 +222,7 @@ Tensor decode(const Tensor& packed, const Tensor& escapes, int64_t exp_base) {
   const WeightView w = weight_view(packed, escapes, exp_base);
   Tensor out = at::empty({w.n, w.k}, packed.options().dtype(at::kBFloat16));
   run([&](TorchEncoder& e) {
-    launch_decode(e, w.packed, nonempty(w.escapes), nullptr, nullptr, w.exp_base, 1, w.n, w.k, out, w.k);
+    launch_decode(e, w.packed, nonempty(w.escapes), nullptr, Base{nullptr, w.exp_base}, 1, w.n, w.k, out, w.k);
   });
   return out;
 }
@@ -246,7 +248,7 @@ Tensor embedding(const Tensor& ids_in, const Tensor& packed, const Tensor& escap
   TORCH_CHECK(num_ids <= UINT32_MAX, "nf12.embedding: too many ids");
   const Tensor ids = ids_in.contiguous();
   run([&](TorchEncoder& e) {
-    launch_embedding(e, w.packed, nonempty(w.escapes), w.exp_base, ids, id_type == at::kLong, uint64_t(num_ids), w.n,
+    launch_embedding(e, w.packed, nonempty(w.escapes), Base{nullptr, w.exp_base}, ids, id_type == at::kLong, uint64_t(num_ids), w.n,
                      w.k, out);
   });
   return out;
@@ -265,7 +267,7 @@ void decode_gemm(const WeightView& w, const Tensor& x2, const std::optional<Tens
     Tensor wd = r == rows ? buf : buf.narrow(0, 0, r);
     const Tensor slice = w.packed.narrow(0, n0, r);
     run([&](TorchEncoder& e) {
-      launch_decode(e, slice, nonempty(w.escapes), nullptr, nullptr, w.exp_base, 1, r, w.k, wd, w.k);
+      launch_decode(e, slice, nonempty(w.escapes), nullptr, Base{nullptr, w.exp_base}, 1, r, w.k, wd, w.k);
     });
     Tensor ys = bias.has_value() ? at::addmm(bias->narrow(0, n0, r), x2, wd.t()) : at::mm(x2, wd.t());
     if (r == w.n) {
@@ -304,7 +306,7 @@ Tensor run_linear(const Tensor& x, const Tensor& packed, int64_t n, int64_t k, c
   } else {
     run([&](TorchEncoder& e) {
       launch_linear(e, route, x2, uint64_t(row_stride(x2)), packed, nf12, nf12 ? nonempty(nf12_view->escapes) : nullptr,
-                    nf12 ? nf12_view->exp_base : 0, opt(bias), y2, m, n, k);
+                    Base{nullptr, nf12 ? nf12_view->exp_base : 0u}, opt(bias), y2, m, n, k);
     });
   }
   return y;
@@ -411,7 +413,7 @@ std::tuple<Tensor, Tensor> moe_align(const Tensor& topk_ids_in, int64_t num_expe
   const uint32_t a = uint32_t(t * topk), e = uint32_t(num_experts);
   Tensor sorted = at::empty({int64_t(a)}, ids.options());
   Tensor offsets = at::empty({num_experts + 1}, ids.options().dtype(at::kLong));
-  Tensor bases = at::empty({int64_t(align_scratch_words(a, e))}, ids.options());
+  Tensor bases = at::empty({static_cast<int64_t>(align_scratch_words(a, e))}, ids.options());
   run([&](TorchEncoder& g) { launch_moe_align(g, ids, a, e, bases, sorted, offsets); });
   return {sorted, offsets};
 }
@@ -472,7 +474,7 @@ Tensor moe_decode(const Tensor& packed, const Tensor& escapes, const Tensor& esc
   const MoeWeight w = moe_weight_view(packed, escapes, escape_offsets, exp_base);
   Tensor out = at::empty({w.experts, w.n, w.k}, packed.options().dtype(at::kBFloat16));
   run([&](TorchEncoder& e) {
-    launch_decode(e, w.packed, nonempty(*w.escapes), &*w.escape_offsets, &*w.exp_base, 0, w.experts, w.n, w.k, out,
+    launch_decode(e, w.packed, nonempty(*w.escapes), &*w.escape_offsets, Base{&*w.exp_base, 0}, w.experts, w.n, w.k, out,
                   w.k);
   });
   return out;
