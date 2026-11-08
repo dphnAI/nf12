@@ -7,6 +7,7 @@ import ctypes
 
 import pytest
 import torch
+from portable_random import randn
 
 import nf12
 
@@ -66,8 +67,7 @@ def ptr(t: torch.Tensor, byte_offset: int = 0) -> int:
 
 
 def bf16(*shape: int, seed: int = 0) -> torch.Tensor:
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    return (torch.randn(*shape, device="cuda", generator=g) * 0.05).to(torch.bfloat16)
+    return randn(*shape, seed=seed, scale=0.05, device="cuda")
 
 
 def c_encode(lib, w: torch.Tensor):

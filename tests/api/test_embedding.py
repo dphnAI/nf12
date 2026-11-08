@@ -17,6 +17,7 @@ import nf12
 from nf12 import reference
 
 from _device import DEV, cuda_only, requires_gpu
+from portable_random import generator, rand, randint, randn, randperm
 
 pytestmark = requires_gpu
 
@@ -34,16 +35,15 @@ def assert_bitwise(a: torch.Tensor, b: torch.Tensor) -> None:
 
 
 def table(v: int, h: int, seed: int = 0, scale: float = 0.02) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return (torch.randn(v, h, device=DEV, generator=g) * scale).to(torch.bfloat16)
+    return randn(v, h, seed=seed, scale=scale, device=DEV)
 
 
 def special_table(v: int, h: int, seed: int = 0) -> torch.Tensor:
     """Normal rows, 5% random bit patterns, every special value, and zero (padding) rows."""
-    g = torch.Generator(device=DEV).manual_seed(seed + 7)
+    g = generator(seed + 7)
     w = table(v, h, seed)
-    raw = torch.randint(-32768, 32768, (v, h), device=DEV, generator=g, dtype=torch.int32).to(torch.int16)
-    w = torch.where(torch.rand(v, h, device=DEV, generator=g) < 0.05, raw.view(torch.bfloat16), w)
+    raw = randint(-32768, 32768, (v, h), seed=g, dtype=torch.int32, device=DEV).to(torch.int16)
+    w = torch.where(rand(v, h, seed=g, device=DEV) < 0.05, raw.view(torch.bfloat16), w)
     flat = w.view(-1).view(torch.int16)
     specials = torch.tensor(
         [0x0000, -0x8000, 0x0001, -0x7FFF, 0x007F, 0x7F80, -0x0080, 0x7FC0, 0x7F81, -0x0001, 0x7F7F, 0x0080],
@@ -55,8 +55,7 @@ def special_table(v: int, h: int, seed: int = 0) -> torch.Tensor:
 
 
 def random_ids(n: int, v: int, dtype: torch.dtype, seed: int = 0, margin: int = 3) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return torch.randint(-margin, v + margin, (n,), device=DEV, generator=g).to(dtype)
+    return randint(-margin, v + margin, (n,), seed=seed, device=DEV).to(dtype)
 
 
 SHAPES = [(16, 64), (48, 128), (32, 192), (160, 1024), (64, 3584), (48, 4096), (16, 8192), (32, 4160)]
@@ -93,7 +92,7 @@ def test_heavy_escape_tables(fill):
     elif fill == "neg_zeros":  # -0.0 everywhere encodes without escapes at base 0
         w = torch.full((v, h), -0.0, dtype=torch.bfloat16, device=DEV)
     else:
-        raw = torch.randint(-32768, 32768, (v, h), device=DEV, dtype=torch.int32).to(torch.int16)
+        raw = randint(-32768, 32768, (v, h), seed=11, dtype=torch.int32, device=DEV).to(torch.int16)
         w = raw.view(torch.bfloat16)
     nw = nf12.encode(w)
     expected = {"zeros": v * h // 8, "neg_zeros": 0}.get(fill)
@@ -210,8 +209,8 @@ def test_torch_compile_fullgraph():
 
 
 def make_embedding(v: int, h: int, seed: int = 0) -> nn.Embedding:
-    torch.manual_seed(seed)
-    return nn.Embedding(v, h, device=DEV, dtype=torch.bfloat16)
+    torch.manual_seed(seed)  # CPU initialization is portable; device initialization is not
+    return nn.Embedding(v, h, dtype=torch.bfloat16).to(DEV)
 
 
 def test_nf12_embedding_module():
@@ -412,7 +411,7 @@ def test_real_tables_match_bf16(repo, v, h):
           f"({100 * nw.num_escapes / (v * h // 8):.4f}%)")
     chunk = 32768
     for start in range(0, v, chunk):  # every row once, in a shuffled order
-        ids = torch.randperm(min(chunk, v - start), device=DEV) + start
+        ids = randperm(min(chunk, v - start), seed=start, device=DEV) + start
         assert_bitwise(nf12.embedding(ids, nw), w[ids])
     out_of_range = (torch.tensor([-1, v, 0, v - 1, 2**40], device=DEV),
                     torch.tensor([v - 1, -(2**31), v], device=DEV).int())
@@ -420,7 +419,7 @@ def test_real_tables_match_bf16(repo, v, h):
         assert_bitwise(nf12.embedding(ids, nw), reference.embedding(ids, w))
     if repo == "Qwen/Qwen3-0.6B":
         model = _TiedLM(nw)
-        ids = torch.randint(0, v, (7,), device=DEV)
+        ids = randint(0, v, (7,), seed=7, device=DEV)
         x = model.embed(ids)
         assert_bitwise(x, w[ids])
         torch.testing.assert_close(model.lm_head(x).float(), F.linear(x, w).float(), rtol=2e-2, atol=2e-2)
@@ -434,9 +433,8 @@ def test_huge_offsets():
     v, h = 360448, 8192
     assert v * h * 3 // 2 > 2**32
     w = torch.empty(v, h, dtype=torch.bfloat16, device=DEV)
-    g = torch.Generator(device=DEV).manual_seed(0)
     for r in range(0, v, 16384):
-        w[r:r + 16384] = (torch.randn(min(16384, v - r), h, device=DEV, generator=g) * 0.02).to(torch.bfloat16)
+        w[r:r + 16384] = randn(min(16384, v - r), h, seed=r, scale=0.02, device=DEV)
     w[-1] = 0  # escapes at the end of the table: high escape indices
     w[-9] = 0
     nw = nf12.encode(w)

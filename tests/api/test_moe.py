@@ -14,6 +14,7 @@ import nf12
 from nf12 import reference
 
 from _device import DEV, cuda_only, requires_gpu
+from portable_random import generator, normalized, rand, randint, randn
 
 pytestmark = requires_gpu
 
@@ -29,12 +30,8 @@ def assert_bitwise(a: torch.Tensor, b: torch.Tensor) -> None:
     assert torch.equal(bits(a), bits(b))
 
 
-def gen(seed: int) -> torch.Generator:
-    return torch.Generator(device=DEV).manual_seed(seed)
-
-
 def experts(e: int, n: int, k: int, seed: int = 0, scale: float = 0.05, spread: int = 8) -> torch.Tensor:
-    w = (torch.randn(e, n, k, device=DEV, generator=gen(seed)) * scale).to(torch.bfloat16)
+    w = randn(e, n, k, seed=seed, scale=scale, device=DEV)
     # Expert-dependent escape load: +0.0 blocks hit the M == 0 sentinel, and
     # odd experts are scaled by 2^(spread * [-2, 2]) so their exp_base differs.
     for i in range(e):
@@ -45,14 +42,14 @@ def experts(e: int, n: int, k: int, seed: int = 0, scale: float = 0.05, spread: 
 
 
 def activations(*shape: int, seed: int = 1) -> torch.Tensor:
-    return torch.randn(*shape, device=DEV, generator=gen(seed)).to(torch.bfloat16)
+    return randn(*shape, seed=seed, device=DEV)
 
 
 def routing(t: int, e: int, topk: int, seed: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
-    """Distinct experts per token, softmax weights (float32)."""
-    g = gen(seed)
-    ids = torch.rand(t, e, device=DEV, generator=g).argsort(dim=1)[:, :topk].to(torch.int32)
-    weights = torch.rand(t, topk, device=DEV, generator=g).softmax(dim=1)
+    """Distinct experts per token, normalized positive weights (float32)."""
+    g = generator(seed)
+    ids = rand(t, e, seed=g).argsort(dim=1, stable=True)[:, :topk].to(torch.int32).to(DEV)
+    weights = normalized(1 + rand(t, topk, seed=g)).to(DEV)
     return weights, ids
 
 
@@ -116,7 +113,7 @@ ALIGN_CASES = [
 
 @pytest.mark.parametrize("t,topk,e", ALIGN_CASES)
 def test_align_matches_reference(t, topk, e):
-    ids = torch.randint(-3, e + 3, (t, topk), device=DEV, dtype=torch.int32, generator=gen(t + e))
+    ids = randint(-3, e + 3, (t, topk), seed=t + e, dtype=torch.int32, device=DEV)
     if t:
         ids.view(-1)[::7] = torch.iinfo(torch.int32).max
         ids.view(-1)[::11] = torch.iinfo(torch.int32).min
@@ -140,11 +137,11 @@ def test_align_stable_and_drops():
 
 
 def test_align_int64_ids_and_noncontiguous():
-    ids = torch.randint(0, 32, (40, 8), device=DEV, generator=gen(5))
+    ids = randint(0, 32, (40, 8), seed=5, device=DEV)
     s64, o64 = nf12.moe_align(ids, 32)
     s32, o32 = nf12.moe_align(ids.to(torch.int32), 32)
     assert torch.equal(s64, s32) and torch.equal(o64, o32)
-    wide = torch.randint(0, 32, (40, 16), device=DEV, dtype=torch.int32, generator=gen(6))
+    wide = randint(0, 32, (40, 16), seed=6, dtype=torch.int32, device=DEV)
     s, o = nf12.moe_align(wide[:, ::2], 32)
     rs, ro = reference.moe_align(wide[:, ::2], 32)
     assert torch.equal(o, ro) and torch.equal(s, rs)
@@ -332,6 +329,37 @@ def composed_moe(x, w13, w2, weights, ids):
     return nf12.moe_combine(y, ids.shape[1])
 
 
+def close_fused_moe(out, x, w13, w2, weights, ids) -> None:
+    """``out`` against reference.fused_moe within the first-order error bound of
+    its BF16 intermediates.
+
+    The kernels and the reference round h (after w13) and a = silu(gate) * up
+    to BF16 at the same points, but they accumulate in different orders, so a
+    rounding tie can land one ulp apart. With `h` one ulp off and `a` rounded
+    again, `a` can differ by two ulps (2^-7 relative), and w2 carries that into
+    the output as at most 2^-7 * sum_j weight_j * (|a_j| @ |W2_e|^T). That is
+    small unless the w2 dot product cancels, which is exactly when a fixed
+    tolerance is either too loose or fails. The final BF16 rounding adds half
+    an ulp (2^-8 relative).
+    """
+    x, w13, w2, weights, ids = (v.cpu() for v in (x, w13, w2, weights, ids))
+    ref = reference.fused_moe(x, w13, w2, weights, ids).double()
+    inter = w2.shape[2]
+    bound = torch.zeros_like(ref)
+    for j in range(ids.shape[1]):
+        e = ids[:, j].long()
+        h = torch.einsum("tk,tnk->tn", x.double(), w13[e].double()).to(torch.bfloat16).double()
+        g, u = h[:, :inter], h[:, inter:]
+        a = (g / (1 + torch.exp(-g)) * u).to(torch.bfloat16).double()
+        bound += weights[:, j].double().unsqueeze(1) * torch.einsum("ti,tni->tn", a.abs(), w2[e].double().abs())
+    bound = 2.0 ** -7 * bound + 2.0 ** -8 * ref.abs()
+    err = (out.cpu().double() - ref).abs()
+    worst = int((err - bound).argmax())
+    assert bool((err <= bound).all()), (
+        f"{int((err > bound).sum())} elements exceed the bound; worst at {divmod(worst, ref.shape[1])}: "
+        f"out {out.reshape(-1)[worst].item()}, ref {ref.reshape(-1)[worst].item()}, bound {bound.reshape(-1)[worst].item()}")
+
+
 @pytest.mark.parametrize("t", [1, 4, 32, 200])
 @pytest.mark.parametrize("e,k,inter,topk", [(8, 256, 128, 2), (16, 512, 256, 4)])
 def test_fused_moe(t, e, k, inter, topk):
@@ -342,7 +370,7 @@ def test_fused_moe(t, e, k, inter, topk):
     m2, t2 = twin(w2)
     out = nf12.fused_moe(x, m13, m2, weights, ids)
     assert out.shape == (t, k)
-    close(out, reference.fused_moe(x, w13, w2, weights, ids))
+    close_fused_moe(out, x, w13, w2, weights, ids)
     assert_bitwise(out, nf12.fused_moe(x, t13, t2, weights, ids))
     assert_bitwise(out, nf12.fused_moe(x, m13, m2, weights, ids))
 

@@ -68,3 +68,5 @@ wheel.py-api = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests/api", "tests/mlx"]
+# tests/portable_random.py: seeded data that is identical on every machine and device.
+pythonpath = ["tests"]

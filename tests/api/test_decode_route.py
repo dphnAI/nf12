@@ -20,6 +20,7 @@ from __future__ import annotations
 import ctypes
 import os
 
+import portable_random
 import pytest
 import torch
 
@@ -42,8 +43,7 @@ def bits(t: torch.Tensor) -> torch.Tensor:
 
 
 def rand(*shape: int, seed: int, scale: float = 1.0) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return (torch.randn(*shape, device=DEV, generator=g) * scale).to(torch.bfloat16)
+    return portable_random.randn(*shape, seed=seed, scale=scale, device=DEV)
 
 
 def escaping_weight(n: int, k: int) -> torch.Tensor:

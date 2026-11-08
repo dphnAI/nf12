@@ -21,6 +21,7 @@ import torch  # noqa: E402
 import nf12  # noqa: E402
 import nf12.mlx as nm  # noqa: E402
 from nf12 import reference  # noqa: E402
+from portable_random import generator, normalized, rand, randn  # noqa: E402
 
 MPS = torch.backends.mps.is_available()
 requires_mps = pytest.mark.skipif(not MPS, reason="PyTorch MPS required for parity")
@@ -52,8 +53,7 @@ def assert_bitwise(a: mx.array, b) -> None:
 
 
 def matrix(n: int, k: int, seed: int = 0, scale: float = 0.05, escapes: bool = True) -> mx.array:
-    g = torch.Generator().manual_seed(seed)
-    w = (torch.randn(n, k, generator=g) * scale).to(torch.bfloat16)
+    w = randn(n, k, seed=seed, scale=scale)
     if escapes:
         w[0, 0] = 1e30
         w[n // 2, 5] = float("nan")
@@ -63,8 +63,7 @@ def matrix(n: int, k: int, seed: int = 0, scale: float = 0.05, escapes: bool = T
 
 
 def activations(*shape: int, seed: int = 1) -> mx.array:
-    g = torch.Generator().manual_seed(seed)
-    return to_mlx(torch.randn(*shape, generator=g).to(torch.bfloat16))
+    return to_mlx(randn(*shape, seed=seed))
 
 
 def close_to_reference(y: mx.array, x: mx.array, w: mx.array, bias=None) -> None:
@@ -205,8 +204,7 @@ def moe_route(request, monkeypatch):
 
 
 def experts(e: int, n: int, k: int, seed: int = 0, escapes: bool = True) -> mx.array:
-    g = torch.Generator().manual_seed(seed)
-    w = (torch.randn(e, n, k, generator=g) * 0.05).to(torch.bfloat16)
+    w = randn(e, n, k, seed=seed, scale=0.05)
     if escapes:
         w[0, 0, 0] = 1e30
     w[e - 1, 1, 8:16] = 0.0
@@ -214,9 +212,9 @@ def experts(e: int, n: int, k: int, seed: int = 0, escapes: bool = True) -> mx.a
 
 
 def routing(t: int, e: int, topk: int, seed: int = 2) -> tuple[mx.array, mx.array]:
-    g = torch.Generator().manual_seed(seed)
+    g = generator(seed)
     ids = torch.stack([torch.randperm(e, generator=g)[:topk] for _ in range(t)]).to(torch.int32)
-    weights = torch.rand(t, topk, generator=g)
+    weights = normalized(1 + rand(t, topk, seed=g))
     return to_mlx(weights), to_mlx(ids)
 
 
@@ -337,6 +335,7 @@ def test_fused_moe_expert_map():
 
 @pytest.mark.parametrize("bias", [False, True])
 def test_nf12_linear_module(bias):
+    mx.random.seed(0)  # module initialization draws from MLX's global generator
     lin = mnn.Linear(128, 48, bias=bias)
     lin.set_dtype(mx.bfloat16)
     layer = nm.NF12Linear.from_linear(lin)
@@ -350,6 +349,7 @@ def test_nf12_linear_module(bias):
 
 
 def test_nf12_embedding_module_and_tied_head():
+    mx.random.seed(1)
     emb = mnn.Embedding(64, 128)
     emb.set_dtype(mx.bfloat16)
     layer = nm.NF12Embedding.from_embedding(emb)

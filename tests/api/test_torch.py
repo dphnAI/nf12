@@ -14,6 +14,7 @@ import nf12
 from nf12 import reference
 
 from _device import DEV, cuda_only, requires_gpu
+from portable_random import generator, rand, randint, randn
 
 pytestmark = requires_gpu
 
@@ -29,21 +30,19 @@ def assert_bitwise(a: torch.Tensor, b: torch.Tensor) -> None:
 
 
 def weight(n: int, k: int, seed: int = 0, scale: float = 0.02) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return (torch.randn(n, k, device=DEV, generator=g) * scale).to(torch.bfloat16)
+    return randn(n, k, seed=seed, scale=scale, device=DEV)
 
 
 def activations(*shape: int, seed: int = 1) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return torch.randn(*shape, device=DEV, generator=g).to(torch.bfloat16)
+    return randn(*shape, seed=seed, device=DEV)
 
 
 def special_weight(n: int, k: int) -> torch.Tensor:
     """Random bit patterns plus every class the format must preserve."""
-    g = torch.Generator(device=DEV).manual_seed(7)
+    g = generator(7)
     w = weight(n, k, seed=3)
-    raw = torch.randint(-32768, 32768, (n, k), device=DEV, generator=g, dtype=torch.int32).to(torch.int16)
-    w = torch.where(torch.rand(n, k, device=DEV, generator=g) < 0.05, raw.view(torch.bfloat16), w)
+    raw = randint(-32768, 32768, (n, k), seed=g, dtype=torch.int32, device=DEV).to(torch.int16)
+    w = torch.where(rand(n, k, seed=g, device=DEV) < 0.05, raw.view(torch.bfloat16), w)
     flat = w.view(-1).view(torch.int16)
     specials = torch.tensor(
         [0x0000, -0x8000, 0x0001, -0x7FFF, 0x007F, 0x7F80, -0x0080, 0x7FC0, 0x7F81, -0x0001, 0x7F7F, 0x0080],
@@ -245,8 +244,8 @@ def test_opcheck():
 
 
 def make_linear(k: int, n: int, bias: bool = True, seed: int = 0) -> nn.Linear:
-    torch.manual_seed(seed)
-    return nn.Linear(k, n, bias=bias, device=DEV, dtype=torch.bfloat16)
+    torch.manual_seed(seed)  # CPU initialization (uniform draws) is portable; device initialization is not
+    return nn.Linear(k, n, bias=bias, dtype=torch.bfloat16).to(DEV)
 
 
 @pytest.mark.parametrize("bias", [True, False])
