@@ -1,15 +1,31 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "torch>=2.10"]
+# On Apple silicon the MLX extension is built too. MLX has no stable C++ ABI and
+# its Python bindings share nanobind state only with the same nanobind ABI, so
+# the pair is pinned; nf12.mlx rebuilds for other MLX versions at first use.
+requires = [
+  "scikit-build-core>=0.10",
+  "torch>=2.10",
+  "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "nanobind==3.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "nf12"
 version = "1.0.0"
-description = "Lossless 12-bit encoding of BF16 weights with fused CUDA decode-GEMM kernels"
+description = "Lossless 12-bit encoding of BF16 weights with fused CUDA and Metal (PyTorch MPS, MLX) decode-GEMM kernels"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.10"]
+
+[project.optional-dependencies]
+# nanobind is needed to rebuild the extension for an MLX other than the one
+# the wheel was built with; it must be the nanobind version that MLX uses.
+mlx = [
+  "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "nanobind>=3.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [dependency-groups]
 test = ["pytest", "numpy", "safetensors"]
@@ -20,10 +36,12 @@ bench = ["huggingface-hub", "numpy", "safetensors"]
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "CMakeLists.txt" },
+  { file = "cmake/**/*" },
   { file = "csrc/**/*" },
   { file = "include/**/*" },
   { env = "NF12_CUDA_ARCHS" },
   { env = "NF12_BUILD_NATIVE" },
+  { env = "NF12_BUILD_MLX" },
 ]
 
 [tool.scikit-build]
@@ -41,6 +59,12 @@ sdist.exclude = [".venv", "build"]
 [tool.scikit-build.cmake.define]
 NF12_CUDA_ARCHS = { env = "NF12_CUDA_ARCHS", default = "80;86;89;90;100;110;120" }
 NF12_BUILD_NATIVE = { env = "NF12_BUILD_NATIVE", default = "ON" }
+NF12_BUILD_MLX = { env = "NF12_BUILD_MLX", default = "AUTO" }
+
+# macOS wheels carry the CPython MLX extension (nf12._mlx_ext).
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+wheel.py-api = ""
 
 [tool.pytest.ini_options]
-testpaths = ["tests/api"]
+testpaths = ["tests/api", "tests/mlx"]

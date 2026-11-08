@@ -18,7 +18,7 @@ from typing import Mapping
 import torch
 
 from ._library import load
-from .api import ESCAPES_KEY, EXP_BASE_KEY, PACKED_KEY, _check_cuda, check_weight_shape
+from .api import ESCAPES_KEY, EXP_BASE_KEY, PACKED_KEY, _check_device, _is_mlx, _mlx, check_weight_shape
 
 ESCAPE_OFFSETS_KEY = "nf12_escape_offsets"
 
@@ -75,7 +75,7 @@ class NF12MoEWeight:
 
     def decode(self) -> torch.Tensor:
         """Recovers the original ``[E, N, K]`` BF16 expert weights."""
-        _check_cuda(self.packed, "weight")
+        _check_device(self.packed, "weight")
         load()
         return torch.ops.nf12.moe_decode(self.packed, self.escapes, self.escape_offsets, self.exp_base)
 
@@ -112,13 +112,15 @@ class NF12MoEWeight:
 def _check_experts(w: torch.Tensor) -> None:
     if w.dtype != torch.bfloat16 or w.dim() != 3 or w.shape[0] < 1:
         raise ValueError(f"nf12: experts must be a bfloat16 [E, N, K] tensor, got {w.dtype} {tuple(w.shape)}")
-    _check_cuda(w, "weight")
+    _check_device(w, "weight")
     check_weight_shape(*w.shape[1:])
 
 
 def encode_moe(w: torch.Tensor) -> NF12MoEWeight:
-    """Losslessly encodes stacked ``[E, N, K]`` bf16 CUDA experts, each exactly as
+    """Losslessly encodes stacked ``[E, N, K]`` bf16 CUDA or MPS experts, each exactly as
     :func:`nf12.encode` would encode it alone. Synchronizes the current stream."""
+    if _is_mlx(w):
+        return _mlx().encode_moe(w)
     _check_experts(w)
     load()
     return NF12MoEWeight(*torch.ops.nf12.encode_moe(w))
@@ -126,6 +128,8 @@ def encode_moe(w: torch.Tensor) -> NF12MoEWeight:
 
 def pack_bf16t_moe(w: torch.Tensor) -> torch.Tensor:
     """Packs ``[E, N, K]`` bf16 experts into the bf16t twin layout, uint8 ``[E, N, 2K]``."""
+    if _is_mlx(w):
+        return _mlx().pack_bf16t_moe(w)
     _check_experts(w)
     load()
     e, n, k = w.shape
@@ -134,7 +138,7 @@ def pack_bf16t_moe(w: torch.Tensor) -> torch.Tensor:
 
 
 def _prepare_topk_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
-    _check_cuda(topk_ids, "topk_ids")
+    _check_device(topk_ids, "topk_ids")
     if topk_ids.dim() != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"nf12: topk_ids must be an int32/int64 [T, topk] tensor, got {topk_ids.dtype} "
                          f"{tuple(topk_ids.shape)}")
@@ -152,13 +156,15 @@ def moe_align(topk_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, t
     are dropped, ``off[E]`` counts the rest and later entries of ``sorted`` are
     unspecified.
     """
+    if _is_mlx(topk_ids):
+        return _mlx().moe_align(topk_ids, num_experts)
     topk_ids = _prepare_topk_ids(topk_ids, num_experts)
     load()
     return torch.ops.nf12.moe_align(topk_ids, num_experts)
 
 
 def _check_moe_input(x: torch.Tensor, k: int) -> None:
-    _check_cuda(x, "x")
+    _check_device(x, "x")
     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != k:
         raise ValueError(f"nf12: x must be a bfloat16 [rows, {k}] tensor, got {x.dtype} {tuple(x.shape)}")
 
@@ -177,6 +183,9 @@ def moe_linear(x: torch.Tensor, weight: NF12MoEWeight | torch.Tensor, expert_off
     large-T decode + ``torch._grouped_mm`` route of SPEC.md 9.4. That route
     matches those grouped GEMMs on the decoded experts.
     """
+    if _is_mlx(x, weight):
+        return _mlx().moe_linear(x, weight, expert_offsets, gather=gather, gather_div=gather_div, scatter=scatter,
+                                 row_scale=row_scale, zero_fill=zero_fill)
     if isinstance(weight, NF12MoEWeight):
         _check_moe_input(x, weight.shape[2])
         load()
@@ -190,6 +199,9 @@ def moe_linear_bf16t(x: torch.Tensor, w_bf16t: torch.Tensor, expert_offsets: tor
                      gather: torch.Tensor | None = None, gather_div: int = 1, scatter: torch.Tensor | None = None,
                      row_scale: torch.Tensor | None = None, zero_fill: bool = False) -> torch.Tensor:
     """:func:`moe_linear` on a bf16t twin ``uint8 [E, N, 2K]``."""
+    if _is_mlx(x, w_bf16t):
+        return _mlx().moe_linear_bf16t(x, w_bf16t, expert_offsets, gather=gather, gather_div=gather_div,
+                                       scatter=scatter, row_scale=row_scale, zero_fill=zero_fill)
     if w_bf16t.dtype != torch.uint8 or w_bf16t.dim() != 3:
         raise ValueError(f"nf12: w_bf16t must be uint8 [E, N, 2K], got {w_bf16t.dtype} {tuple(w_bf16t.shape)}")
     _check_moe_input(x, w_bf16t.shape[2] // 2)
@@ -200,7 +212,9 @@ def moe_linear_bf16t(x: torch.Tensor, w_bf16t: torch.Tensor, expert_offsets: tor
 
 def moe_combine(y: torch.Tensor, topk: int) -> torch.Tensor:
     """``out[t] = sum_j y[t * topk + j]`` in FP32 in increasing ``j``, returning bf16 ``[T, N]``."""
-    _check_cuda(y, "y")
+    if _is_mlx(y):
+        return _mlx().moe_combine(y, topk)
+    _check_device(y, "y")
     load()
     return torch.ops.nf12.moe_combine(y, topk)
 
@@ -211,7 +225,9 @@ def moe_silu_mul(h: torch.Tensor) -> torch.Tensor:
     ``out = bf16(s * u)`` with ``s = g / (1 + exp(-g))`` in FP32 (one kernel,
     one BF16 rounding).
     """
-    _check_cuda(h, "h")
+    if _is_mlx(h):
+        return _mlx().moe_silu_mul(h)
+    _check_device(h, "h")
     load()
     return torch.ops.nf12.moe_silu_mul(h)
 
@@ -256,6 +272,8 @@ def fused_moe(x: torch.Tensor, w13: NF12MoEWeight | torch.Tensor, w2: NF12MoEWei
     experts on other ranks). Dropped assignments contribute zero, so the
     result is this rank's partial sum.
     """
+    if _is_mlx(x, w13):
+        return _mlx().fused_moe(x, w13, w2, topk_weights, topk_ids, activation, expert_map=expert_map)
     if activation != "silu":
         raise ValueError(f"nf12: unsupported activation {activation!r} (only 'silu')")
     e13, n13, k13 = _out_features(w13)

@@ -181,6 +181,11 @@ For a weight named `W`:
   order) and across CTAs (FP32 partials in the workspace, summed in rank
   order by a second kernel).
 
+- Apple GPUs (Metal, macOS 14+): the same format and torch ops on MPS tensors,
+  and the same operations on MLX arrays (`nf12.mlx`), with simdgroup kernels
+  (`csrc/metal/`) shared by both frameworks and the numerics of section 6. Routing
+  and measured thresholds are in docs/METAL.md.
+
 ## 8. Public API
 
 ### 8.1 C API (`include/nf12/nf12.h`)

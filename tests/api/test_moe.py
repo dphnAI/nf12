@@ -13,9 +13,10 @@ import torch
 import nf12
 from nf12 import reference
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+from _device import DEV, cuda_only, requires_gpu
 
-DEV = "cuda"
+pytestmark = requires_gpu
+
 OK, INVALID, UNSUPPORTED, INSUFFICIENT, CUDA_ERROR = range(5)
 
 
@@ -409,7 +410,9 @@ def test_fused_moe_strided_inputs(t, layout):
     else:
         x = activations(1, k).expand(t, k)
     ids = torch.tensor([[0, 7, 1, 7, 0, 7, 1, 7]], dtype=torch.int64, device=DEV).expand(t, -1)[:, ::2]
-    weights = torch.tensor([[0.125, 9, 0.25, 9, -0.5, 9, 0.75, 9]], dtype=torch.float64,
+    # MPS has no float64; float32 still exercises the strided, non-contiguous path.
+    weights = torch.tensor([[0.125, 9, 0.25, 9, -0.5, 9, 0.75, 9]],
+                           dtype=torch.float64 if DEV == "cuda" else torch.float32,
                            device=DEV).expand(t, -1)[:, ::2]
     expected = nf12.fused_moe(x.contiguous().clone(), m13, m2, weights.float().contiguous(), ids.int().contiguous())
     assert_bitwise(nf12.fused_moe(x, m13, m2, weights, ids), expected)
@@ -481,6 +484,7 @@ def test_fused_moe_expert_map_drops_out_of_range_global_ids():
 
 
 @pytest.mark.parametrize("t,k,inter", [(8, 512, 256), (1, 1024, 512)])
+@cuda_only
 def test_fused_moe_cuda_graph(t, k, inter):
     e, topk = 4, 4
     w13, w2 = moe_layer(e, k, inter)
@@ -625,7 +629,7 @@ def test_fused_moe_validates_before_dispatch(t):
         (2, m13.escapes.float(), "escapes"),
         (3, strided_offsets, "escape_offsets"),
         (4, m13.exp_base.to(torch.int32), "exp_base"),
-        (5, m2.packed.cpu(), "CUDA"),
+        (5, m2.packed.cpu(), "CUDA|MPS"),
         (9, weights.to(torch.bfloat16), "float32"),
         (10, ids.to(torch.int64), "int32"),
     ):
@@ -689,6 +693,8 @@ class MoeWeight(ctypes.Structure):
 
 @pytest.fixture(scope="module")
 def lib():
+    if DEV != "cuda":
+        pytest.skip("the C API is CUDA only")
     lib = ctypes.CDLL(str(nf12.library_path()))
     p, i64, sz, i32 = ctypes.c_void_p, ctypes.c_int64, ctypes.c_size_t, ctypes.c_int
     sigs = {

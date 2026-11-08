@@ -4,17 +4,21 @@ NF12 is a lossless, fixed-length 12-bit encoding of BF16 weight matrices,
 based on "NyoomFloat12: Accelerating LLM Inference via Lossless 12-bit Weight
 Compression" (Liberman, Fang, Zhang, Dao, Fu, Together AI, 2026). This library
 implements this data type efficiently on NVIDIA GPUs, from the Ampere generation
-up until Blackwell.
+up until Blackwell, and on Apple Silicon GPUs through Metal, for both PyTorch
+(MPS) and MLX (see [docs/METAL.md](docs/METAL.md)).
 
 This library's bit and memory layout (tiled) are not compatible with the one
 described in the paper. You can read [the spec](docs/SPEC.md) for more info on the format.
 
 ## Requirements
 
-- NVIDIA GPU with SM80 or newer (Ampere and later).
-- CUDA toolkit 13.0+, a C++ compiler, CMake 3.26+, and Ninja for builds.
+- NVIDIA GPU with SM80 or newer (Ampere and later) and CUDA toolkit 13.0+, or an
+  Apple Silicon Mac (macOS 14+) with Xcode and its Metal Toolchain
+  (`xcodebuild -downloadComponent MetalToolchain`).
+- A C++ compiler, CMake 3.26+, and Ninja for builds.
 - uv for Python environment management and builds.
-- Python 3.10+ and CUDA-enabled PyTorch 2.10+ for the Python package.
+- Python 3.10+ and PyTorch 2.10+ (CUDA, or MPS on a Mac) for the Python package;
+  optionally MLX 0.32+ on a Mac.
 - Weight shapes: `N` (out_features) a multiple of 16, `K` (in_features) a
   multiple of 64.
 
@@ -26,12 +30,14 @@ uv pip install nf12
 
 Linux x86-64 and ARM64 wheels include kernels for SM80, 86, 89, 90, 100, 110,
 and 120. They bundle the CUDA 13 runtime and require a compatible NVIDIA driver.
+There are no macOS wheels yet; build the Metal backend from source.
 
 From source:
 
 ```bash
 uv sync --locked                          # all supported architectures
 NF12_CUDA_ARCHS=120 uv sync --locked      # one architecture for development
+uv sync --locked --extra mlx              # macOS: Metal for PyTorch MPS and MLX
 ```
 
 To defer compilation until the first native operation:
@@ -61,7 +67,21 @@ x = torch.randn(2, 7, 4096, dtype=torch.bfloat16, device="cuda")
 y = nf12.linear(x, nw)  # preserves leading dimensions
 ```
 
-Use `nf12.NF12Linear.from_linear(layer)` to convert a BF16 CUDA `nn.Linear`.
+On a Mac, use `device="mps"`: the same API runs on the Metal backend. MLX arrays
+work too, through the same functions or `nf12.mlx` (which does not import torch):
+
+```python
+import mlx.core as mx
+import nf12.mlx as nm
+
+w = mx.random.normal((4096, 4096)).astype(mx.bfloat16)
+nw = nm.encode(w)  # nf12.encode(w) routes MLX arrays here as well
+y = nm.linear(mx.random.normal((7, 4096)).astype(mx.bfloat16), nw)
+```
+
+Build with the `mlx` extra (`uv sync --locked --extra mlx`) for MLX.
+
+Use `nf12.NF12Linear.from_linear(layer)` to convert a BF16 CUDA or MPS `nn.Linear`.
 Decoding recovers the original weights. GEMM outputs can differ from cuBLAS
 due to accumulation order.
 
@@ -138,6 +158,7 @@ Median of two run medians. PyTorch 2.15, CUDA 13.2.
 ## Reference
 
 - [Format and API specification](docs/SPEC.md)
+- [Apple GPU (Metal) backend](docs/METAL.md)
 - [C API](include/nf12/nf12.h)
 - [Benchmarks](bench/) and [tests](tests/)
 

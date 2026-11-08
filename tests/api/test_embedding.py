@@ -16,9 +16,10 @@ from torch import nn
 import nf12
 from nf12 import reference
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+from _device import DEV, cuda_only, requires_gpu
 
-DEV = "cuda"
+pytestmark = requires_gpu
+
 INT32_MIN, INT32_MAX = -(2**31), 2**31 - 1
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 
@@ -152,11 +153,11 @@ def test_errors():
         nf12.embedding(ids.float(), nw)
     with pytest.raises(ValueError, match="int32 or int64"):
         nf12.embedding(ids.to(torch.int16), nw)
-    with pytest.raises(ValueError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA|MPS"):
         nf12.embedding(ids.cpu(), nw)
     with pytest.raises(RuntimeError, match="int32 or int64"):
         torch.ops.nf12.embedding(ids.to(torch.uint8), nw.packed, nw.escapes, nw.exp_base)
-    with pytest.raises(RuntimeError, match="CUDA"):
+    with pytest.raises(RuntimeError, match="CUDA|MPS"):
         torch.ops.nf12.embedding(ids.cpu(), nw.packed, nw.escapes, nw.exp_base)
     with pytest.raises(RuntimeError, match="exp_base"):
         torch.ops.nf12.embedding(ids, nw.packed, nw.escapes, 121)
@@ -170,6 +171,7 @@ def test_opcheck():
 
 @pytest.mark.parametrize("n", [1, 64, 5000])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@cuda_only
 def test_cuda_graph_capture_replay(n, dtype):
     v, h = 512, 1024
     w = special_table(v, h)
@@ -304,6 +306,8 @@ class Weight(ctypes.Structure):
 
 @pytest.fixture(scope="module")
 def lib():
+    if DEV != "cuda":
+        pytest.skip("the C API is CUDA only")
     lib = ctypes.CDLL(str(nf12.library_path()))
     p, i64 = ctypes.c_void_p, ctypes.c_int64
     for name in ("nf12_embedding", "nf12_embedding_i64"):

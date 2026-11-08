@@ -31,7 +31,17 @@ list(APPEND _nf12_archs "${_nf12_max_arch}-virtual")
 set(CMAKE_CUDA_ARCHITECTURES "${_nf12_archs}")
 
 option(NF12_BUILD_NATIVE "Build native libraries during installation" ON)
-if(NF12_BUILD_NATIVE)
+# macOS hosts build the Apple GPU (Metal) backend instead of CUDA (cmake/Metal.cmake).
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+  set(NF12_METAL ON)
+else()
+  set(NF12_METAL OFF)
+endif()
+if(NF12_BUILD_NATIVE AND NF12_METAL)
+  # Metal 3.1 (simdgroup_matrix, bfloat helpers) needs macOS 14.
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
+  project(nf12 VERSION 1.0.0 LANGUAGES CXX OBJCXX)
+elseif(NF12_BUILD_NATIVE)
   project(nf12 VERSION 1.0.0 LANGUAGES CXX CUDA)
 else()
   project(nf12 VERSION 1.0.0 LANGUAGES NONE)
@@ -39,10 +49,16 @@ endif()
 
 # Installed wheels retain the sources for runtime builds without a checkout.
 install(FILES CMakeLists.txt DESTINATION nf12/_src)
+install(DIRECTORY cmake DESTINATION nf12/_src)
 install(DIRECTORY csrc include DESTINATION nf12/_src
   FILES_MATCHING PATTERN "*.cu" PATTERN "*.cpp" PATTERN "*.cuh"
-  PATTERN "*.h" PATTERN "*.map")
+  PATTERN "*.h" PATTERN "*.map" PATTERN "*.metal" PATTERN "*.mm")
 if(NOT NF12_BUILD_NATIVE)
+  return()
+endif()
+
+if(NF12_METAL)
+  include(cmake/Metal.cmake)
   return()
 endif()
 

@@ -13,9 +13,10 @@ from torch import nn
 import nf12
 from nf12 import reference
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+from _device import DEV, cuda_only, requires_gpu
 
-DEV = "cuda"
+pytestmark = requires_gpu
+
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:
@@ -65,6 +66,9 @@ def _route_query():
 def torch_op_routes(m: int, n: int, k: int) -> bool:
     """Whether nf12.linear takes the decode + cuBLAS route at (m, n, k) on this device. Its output matches
     the same cuBLAS calls on decode(W) (tests/api/test_decode_route.py), not the bf16t twin (SPEC.md 6.5)."""
+    if DEV == "mps":
+        nf12.load()
+        return torch.ops.nf12._mps_decode_gemm_rows(m, n, k) > 0
     return _route_query()(m, n, k, torch.cuda.current_device()) > 0
 
 
@@ -205,14 +209,14 @@ def test_errors():
         nf12.encode(weight(16, 96))
     with pytest.raises(ValueError, match="bfloat16"):
         nf12.encode(weight(16, 64).float())
-    with pytest.raises(ValueError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA|MPS"):
         nf12.encode(weight(16, 64).cpu())
     nw = nf12.encode(weight(16, 64))
     with pytest.raises(ValueError, match=r"\[\.\.\., 64\]"):
         nf12.linear(activations(2, 128), nw)
     with pytest.raises(ValueError, match="bfloat16"):
         nf12.linear(activations(2, 64).half(), nw)
-    with pytest.raises(ValueError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA|MPS"):
         nf12.linear(activations(2, 64).cpu(), nw)
     with pytest.raises(RuntimeError, match="bias"):
         nf12.linear(activations(2, 64), nw, torch.zeros(8, dtype=torch.bfloat16, device=DEV))
@@ -295,7 +299,7 @@ def test_module_state_dict_safetensors(tmp_path):
     fresh = nn.Sequential(nf12.NF12Linear(256, 128, device=DEV), nn.GELU(),
                           nf12.NF12Linear(128, 64, bias=False, device=DEV))
     fresh.load_state_dict(loaded)
-    assert fresh[0].nf12_packed.device.type == "cuda"
+    assert fresh[0].nf12_packed.device.type == DEV
     x = activations(5, 256)
     with torch.no_grad():
         assert_bitwise(fresh(x), model(x))
@@ -323,6 +327,7 @@ def test_module_state_dict_safetensors(tmp_path):
     (512, 128, 2048), (513, 128, 2048),
     (192, 128, 4096), (193, 128, 4096),
 ])
+@cuda_only
 def test_cuda_graph_capture_replay(m, n, k):
     nw = nf12.encode(weight(n, k))
     bias = activations(n)

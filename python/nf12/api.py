@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Functional API over ``torch.ops.nf12`` (SPEC.md section 8.2)."""
+"""Functional API over ``torch.ops.nf12`` (SPEC.md section 8.2).
+
+MLX arrays (and :mod:`nf12.mlx` weights) are routed to :mod:`nf12.mlx`."""
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
 from typing import Mapping
 
 import torch
@@ -15,6 +18,16 @@ ESCAPES_KEY = "nf12_escapes"
 EXP_BASE_KEY = "nf12_exp_base"
 
 
+def _is_mlx(*values) -> bool:
+    """True if any value is an MLX array or an nf12.mlx weight (checked by
+    module, so PyTorch-only callers never import MLX)."""
+    return any(type(v).__module__.partition(".")[0] == "mlx" or type(v).__module__ == "nf12.mlx" for v in values)
+
+
+def _mlx():
+    return importlib.import_module("nf12.mlx")
+
+
 def check_weight_shape(n: int, k: int) -> None:
     if n <= 0 or n % 16:
         raise ValueError(f"nf12: out_features (N) must be a positive multiple of 16, got {n}")
@@ -22,15 +35,16 @@ def check_weight_shape(n: int, k: int) -> None:
         raise ValueError(f"nf12: in_features (K) must be a positive multiple of 64, got {k}")
 
 
-def _check_cuda(t: torch.Tensor, name: str) -> None:
-    if not t.is_cuda:
-        raise ValueError(f"nf12: {name} must be a CUDA tensor, got device {t.device}")
+def _check_device(t: torch.Tensor, name: str) -> None:
+    """NF12 kernels run on CUDA GPUs and, on macOS, on Apple GPUs (MPS)."""
+    if not (t.is_cuda or t.device.type == "mps"):
+        raise ValueError(f"nf12: {name} must be a CUDA or MPS tensor, got device {t.device}")
 
 
 def _check_bf16_matrix(w: torch.Tensor, name: str) -> None:
     if w.dtype != torch.bfloat16 or w.dim() != 2:
         raise ValueError(f"nf12: {name} must be a 2-D bfloat16 tensor, got {w.dtype} with shape {tuple(w.shape)}")
-    _check_cuda(w, name)
+    _check_device(w, name)
     check_weight_shape(*w.shape)
 
 
@@ -93,7 +107,9 @@ class NF12Weight:
 
 
 def encode(w: torch.Tensor) -> NF12Weight:
-    """Losslessly encodes a ``[N, K]`` bf16 CUDA matrix. Synchronizes the current stream."""
+    """Losslessly encodes a ``[N, K]`` bf16 CUDA or MPS matrix (or MLX array). Synchronizes the current stream."""
+    if _is_mlx(w):
+        return _mlx().encode(w)
     _check_bf16_matrix(w, "weight")
     load()
     packed, escapes, exp_base = torch.ops.nf12.encode(w)
@@ -102,13 +118,15 @@ def encode(w: torch.Tensor) -> NF12Weight:
 
 def decode(weight: NF12Weight) -> torch.Tensor:
     """Recovers the original ``[N, K]`` BF16 matrix."""
-    _check_cuda(weight.packed, "weight")
+    if _is_mlx(weight):
+        return _mlx().decode(weight)
+    _check_device(weight.packed, "weight")
     load()
     return torch.ops.nf12.decode(weight.packed, weight.escapes, weight.exp_base)
 
 
 def _check_input(x: torch.Tensor, k: int) -> None:
-    _check_cuda(x, "x")
+    _check_device(x, "x")
     if x.dtype != torch.bfloat16:
         raise ValueError(f"nf12: x must be bfloat16, got {x.dtype}")
     if x.dim() == 0 or x.shape[-1] != k:
@@ -121,6 +139,8 @@ def linear(x: torch.Tensor, weight: NF12Weight, bias: torch.Tensor | None = None
     At the per-architecture M threshold (SPEC.md 6.5), row slices are decoded
     and multiplied by cuBLAS, matching the same calls on :func:`decode`.
     Below that threshold the C API ``nf12_linear`` runs."""
+    if _is_mlx(x, weight):
+        return _mlx().linear(x, weight, bias)
     _check_input(x, weight.shape[1])
     load()
     return torch.ops.nf12.linear(x, weight.packed, weight.escapes, weight.exp_base, bias)
@@ -129,7 +149,9 @@ def linear(x: torch.Tensor, weight: NF12Weight, bias: torch.Tensor | None = None
 def embedding(ids: torch.Tensor, weight: NF12Weight) -> torch.Tensor:
     """Embedding lookup ``W[ids]`` (SPEC.md section 10): int32 or int64 ``ids`` of any shape -> bf16
     ``[*ids.shape, K]``, preserving the table values. IDs outside ``[0, N)`` give ``+0.0`` rows."""
-    _check_cuda(ids, "ids")
+    if _is_mlx(ids, weight):
+        return _mlx().embedding(ids, weight)
+    _check_device(ids, "ids")
     if ids.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"nf12: ids must be int32 or int64, got {ids.dtype}")
     load()
@@ -138,6 +160,8 @@ def embedding(ids: torch.Tensor, weight: NF12Weight) -> torch.Tensor:
 
 def pack_bf16t(w: torch.Tensor) -> torch.Tensor:
     """Packs ``[N, K]`` bf16 into the uncompressed bf16t twin layout, uint8 ``[N, 2K]`` (SPEC.md 4.4)."""
+    if _is_mlx(w):
+        return _mlx().pack_bf16t(w)
     _check_bf16_matrix(w, "weight")
     load()
     return torch.ops.nf12.pack_bf16t(w)
@@ -147,6 +171,8 @@ def linear_bf16t(x: torch.Tensor, w_bf16t: torch.Tensor, bias: torch.Tensor | No
     """Linear on a bf16t-packed weight, matching C API ``nf12_linear`` on NF12.
 
     Also matches :func:`linear` below the decode + cuBLAS crossover (SPEC.md 6.5)."""
+    if _is_mlx(x, w_bf16t):
+        return _mlx().linear_bf16t(x, w_bf16t, bias)
     _check_input(x, w_bf16t.shape[1] // 2)
     load()
     return torch.ops.nf12.linear_bf16t(x, w_bf16t, bias)

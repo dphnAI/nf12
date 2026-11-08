@@ -7,6 +7,7 @@ Nothing is loaded at ``import nf12`` time, so pure-Python modules such as
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 
@@ -17,17 +18,26 @@ import nf12
 _lock = threading.Lock()
 _loaded = False
 
+# macOS builds the Apple GPU backend: libnf12_mps.dylib plus nf12.metallib.
+METAL = sys.platform == "darwin"
+TORCH_LIBRARY = "libnf12_mps.dylib" if METAL else "libnf12_torch.so"
+# Files that must sit next to each torch library.
+_COMPANIONS = {"libnf12_torch.so": ("libnf12.so",), "libnf12_mps.dylib": ("nf12.metallib",)}
+_NATIVE = {"libnf12.so", "libnf12_torch.so", "libnf12_mps.dylib", "nf12.metallib"}
+
 
 def library_path(name: str = "libnf12.so") -> Path:
     """Find a packaged native library, or build and cache it for visible GPUs."""
+    if METAL and name in ("libnf12.so", "libnf12_torch.so"):
+        raise ImportError(f"nf12: {name} (the C API and CUDA torch ops) is CUDA only; macOS builds the Metal backend")
     # Editable installs put the native install tree before the Python source tree.
     for directory in nf12.__path__:
         candidate = Path(directory) / name
         if candidate.is_file():
-            if name == "libnf12_torch.so" and not candidate.with_name("libnf12.so").is_file():
+            if not all(candidate.with_name(c).is_file() for c in _COMPANIONS.get(name, ())):
                 continue
             return candidate
-    if name in ("libnf12.so", "libnf12_torch.so"):
+    if name in _NATIVE:
         from ._jit import library_directory
 
         return library_directory() / name
@@ -42,7 +52,7 @@ def load() -> None:
     with _lock:
         if _loaded:
             return
-        torch.ops.load_library(str(library_path("libnf12_torch.so")))
+        torch.ops.load_library(str(library_path(TORCH_LIBRARY)))
         _register_fakes()
         _loaded = True
 

@@ -124,7 +124,7 @@ class NF12Linear(_NF12WeightModule):
 
     @classmethod
     def from_linear(cls, linear: nn.Linear) -> NF12Linear:
-        """Losslessly converts a bf16 CUDA ``nn.Linear``."""
+        """Losslessly converts a bf16 CUDA or MPS ``nn.Linear``."""
         w = linear.weight.detach()
         _check_bf16(w)
         return cls.from_weight(encode(w), linear.bias)
@@ -190,7 +190,7 @@ class NF12Embedding(_NF12WeightModule):
 
     @classmethod
     def from_embedding(cls, embedding: nn.Embedding) -> NF12Embedding:
-        """Losslessly converts a bf16 CUDA ``nn.Embedding``. Rejects ``max_norm``, which rewrites rows."""
+        """Losslessly converts a bf16 CUDA or MPS ``nn.Embedding``. Rejects ``max_norm``, which rewrites rows."""
         if embedding.max_norm is not None:
             raise ValueError("nf12: NF12Embedding does not support max_norm")
         w = embedding.weight.detach()
