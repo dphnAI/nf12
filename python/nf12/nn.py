@@ -9,11 +9,52 @@ both modules. Construct ``NF12Embedding.from_weight(w)`` and
 
 from __future__ import annotations
 
+import sys
+
 import torch
 from torch import nn
 
 from ._library import load
 from .api import ESCAPES_KEY, EXP_BASE_KEY, PACKED_KEY, NF12Weight, check_weight_shape, encode
+
+def verify_weights(model) -> None:
+    """Checks every NF12 weight in ``model`` is loaded and consistent (its packed
+    array's escaped groups match its escape rows). Call it after assembling
+    weights from partial (e.g. sharded) loads. One synchronization; raises
+    ValueError naming each problem. MLX models are checked by
+    :func:`nf12.mlx.verify_weights`."""
+    if not isinstance(model, nn.Module):
+        mlx_nn = sys.modules.get("mlx.nn")
+        if mlx_nn is not None and isinstance(model, mlx_nn.Module):
+            from . import mlx
+
+            return mlx.verify_weights(model)
+        raise TypeError(f"nf12: verify_weights needs a torch or MLX module, got {type(model).__name__}")
+    problems, counts = [], []
+    for name, module in model.named_modules():
+        if not isinstance(module, _NF12WeightModule):
+            continue
+        where = f"{name}.weight" if name else "weight"
+        if module.nf12_packed.device.type == "meta":
+            problems.append(f"{where}: not loaded (still on the meta device)")
+        else:
+            counts.append((where, escaped_groups(module.nf12_packed), module.nf12_escapes.shape[0]))
+    if counts:
+        device = counts[0][1].device
+        groups = torch.stack([c.to(device) for _, c, _ in counts]).tolist()  # the one synchronization
+        problems += [f"{where}: {PACKED_KEY} has {g} escaped groups but {ESCAPES_KEY} has {rows} rows"
+                     for (where, _, rows), g in zip(counts, groups) if g != rows]
+    if problems:
+        raise ValueError("nf12: NF12 weights failed verification: " + "; ".join(problems))
+
+
+def escaped_groups(packed: torch.Tensor) -> torch.Tensor:
+    """Number of escaped groups in a packed weight (the groups whose 32-bit meta
+    word is the M == 0 sentinel: all four bytes zero), as a 0-d tensor on the
+    weight's device; a consistent weight has that many escape rows."""
+    meta = packed.reshape(-1, 3, 128, 4)[:, 0]  # super-atoms of three 512-byte planes; plane 0 holds the meta words
+    return (meta == 0).all(dim=-1).sum()
+
 
 # One super-atom is 1536 bytes: a 512-byte meta plane, then two low-byte planes.
 _SUPER_ATOM_PLANES = (3, 512)
@@ -72,10 +113,30 @@ class _NF12WeightModule(nn.Module):
         if strict:
             unexpected_keys.extend(key for key in state_dict if key.startswith(prefix) and key not in expected)
 
-        if any(key in missing for key in weight_keys):
+        supplied = {key: state_dict[key] for key in weight_keys if key in state_dict}
+        if not supplied:
             return
+        device = self.nf12_packed.device
+        partial = len(supplied) < len(weight_keys)
+        if partial and device.type == "meta":
+            # No loaded weight to complete a partial one from; the missing keys are
+            # reported (and fail a strict load).
+            return
+        # torch passes strict=True to every module and applies the caller's
+        # strictness afterwards from the key lists, so `strict` cannot tell the
+        # two apart here. As with torch's own modules, supplied entries are
+        # applied and a strict load then reports any missing ones. A weight
+        # assembled from partial loads (e.g. split across shards) is consistent
+        # only once all of its tensors are in: check it with verify_weights().
         try:
-            weight = NF12Weight.from_state_dict(state_dict, weight_prefix)
+            for key, value in supplied.items():
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"{key} must be a tensor, got {type(value).__name__}")
+            merged = supplied
+            if partial:  # missing entries keep their current values
+                merged = {key: value.to(device) for key, value in
+                          {**self.weight.state_dict(weight_prefix), **supplied}.items()}
+            weight = NF12Weight.from_state_dict(merged, weight_prefix)
         except ValueError as e:
             error_msgs.append(f"{weight_prefix[:-1]}: {e}")
             return
@@ -84,8 +145,16 @@ class _NF12WeightModule(nn.Module):
                 f"{weight_prefix[:-1]}: shape {weight.shape} does not match {self._SHAPE_NAME} = {self.weight.shape}"
             )
             return
-        device = self.nf12_packed.device
-        self._assign_weight(weight if device.type == "meta" else weight.to(device))
+        if device.type != "meta":
+            weight = weight.to(device)
+        if weight_keys[0] in supplied and weight_keys[1] in supplied:
+            # Supplied together, packed and escapes must agree: rejects corrupt or truncated files.
+            groups = int(escaped_groups(weight.packed))
+            if groups != weight.num_escapes:
+                error_msgs.append(f"{weight_prefix[:-1]}: {PACKED_KEY} has {groups} escaped groups but "
+                                  f"{ESCAPES_KEY} has {weight.num_escapes} rows")
+                return
+        self._assign_weight(weight)
 
 
 class NF12Linear(_NF12WeightModule):

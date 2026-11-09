@@ -26,7 +26,7 @@ if TYPE_CHECKING:  # static exports for type checkers and IDEs; loaded lazily at
         moe_silu_mul,
         pack_bf16t_moe,
     )
-    from .nn import NF12Embedding, NF12Linear
+    from .nn import NF12Embedding, NF12Linear, verify_weights
 
 __version__ = "1.0.0"
 
@@ -51,6 +51,7 @@ _EXPORTS = {
     "pack_bf16t_moe": ".moe",
     "NF12Embedding": ".nn",
     "NF12Linear": ".nn",
+    "verify_weights": ".nn",
 }
 
 __all__ = sorted(_EXPORTS)

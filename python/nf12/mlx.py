@@ -92,6 +92,24 @@ def _check_bf16_matrix(w: mx.array, name: str) -> None:
     check_weight_shape(*w.shape)
 
 
+def _check_weight_arrays(packed, escapes, exp_base=None, name: str = "") -> None:
+    """Structural checks shared by NF12Weight and load_weights; reads no array data.
+    ``exp_base`` is the array form (one uint8 element) when given."""
+    where = f"{name}." if name else ""
+    for key, value in ((PACKED_KEY, packed), (ESCAPES_KEY, escapes)) + (((EXP_BASE_KEY, exp_base),) if exp_base is not None else ()):
+        if not isinstance(value, mx.array):
+            raise ValueError(f"nf12: {where}{key} must be an mlx.core.array, got {type(value).__name__}")
+    if packed.dtype != mx.uint8:
+        raise ValueError(f"nf12: {where}{PACKED_KEY} must be uint8, got {packed.dtype}")
+    if packed.ndim != 2 or packed.shape[1] % 3:
+        raise ValueError(f"nf12: {where}{PACKED_KEY} must be [N, K*3/2], got shape {tuple(packed.shape)}")
+    if escapes.dtype != mx.int16 or escapes.ndim != 2 or escapes.shape[1] != 8:
+        raise ValueError(f"nf12: {where}{ESCAPES_KEY} must be int16 [E, 8], got {escapes.dtype} {tuple(escapes.shape)}")
+    if exp_base is not None and (exp_base.dtype != mx.uint8 or exp_base.size != 1):
+        raise ValueError(f"nf12: {where}{EXP_BASE_KEY} must be a one-element uint8 array, "
+                         f"got {exp_base.dtype} {tuple(exp_base.shape)}")
+
+
 @dataclasses.dataclass(eq=False)
 class NF12Weight:
     """An NF12-encoded ``[N, K]`` BF16 matrix held in MLX arrays (SPEC.md section 5)."""
@@ -102,13 +120,8 @@ class NF12Weight:
     shape: tuple[int, int] = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
-        p, e = self.packed, self.escapes
-        _check_array(p, "packed")
-        _check_array(e, "escapes")
-        if p.dtype != mx.uint8 or p.ndim != 2 or p.shape[1] % 3:
-            raise ValueError(f"nf12: packed must be uint8 [N, K*3/2], got {p.dtype} {tuple(p.shape)}")
-        if e.dtype != mx.int16 or e.ndim != 2 or e.shape[1] != 8:
-            raise ValueError(f"nf12: escapes must be int16 [E, 8], got {e.dtype} {tuple(e.shape)}")
+        p = self.packed
+        _check_weight_arrays(p, self.escapes)
         self.exp_base = int(self.exp_base)
         if not 0 <= self.exp_base <= 120:
             raise ValueError(f"nf12: exp_base must be in [0, 120], got {self.exp_base}")
@@ -137,10 +150,10 @@ class NF12Weight:
 
     @classmethod
     def from_state_dict(cls, state_dict: Mapping[str, mx.array], prefix: str = "") -> NF12Weight:
+        packed, escapes = state_dict[prefix + PACKED_KEY], state_dict[prefix + ESCAPES_KEY]
         exp_base = state_dict[prefix + EXP_BASE_KEY]
-        if exp_base.dtype != mx.uint8 or exp_base.size != 1:
-            raise ValueError(f"nf12: {prefix + EXP_BASE_KEY} must be a uint8 [1] array")
-        return cls(state_dict[prefix + PACKED_KEY], state_dict[prefix + ESCAPES_KEY], int(exp_base.item()))
+        _check_weight_arrays(packed, escapes, exp_base, prefix[:-1] if prefix.endswith(".") else prefix)
+        return cls(packed, escapes, int(exp_base.item()))
 
 
 def encode(w: mx.array) -> NF12Weight:
@@ -395,7 +408,11 @@ _NEG_ZERO_META = 0xC0
 
 class _NF12WeightModule(nn.Module):
     """Holds an NF12 ``[N, K]`` weight as frozen arrays under SPEC.md section 5
-    names (``weight.nf12_packed``, ``weight.nf12_escapes``, ``weight.nf12_exp_base``)."""
+    names (``weight.nf12_packed``, ``weight.nf12_escapes``, ``weight.nf12_exp_base``).
+
+    The arrays are the only state: every update path (this module's or a parent's
+    ``update``/``load_weights``, an optimizer, ``mx.compile`` placeholders) writes
+    them directly, so nothing derived from them is cached."""
 
     def __init__(self, n: int, k: int) -> None:
         check_weight_shape(n, k)
@@ -406,65 +423,133 @@ class _NF12WeightModule(nn.Module):
 
     def _assign_weight(self, weight: NF12Weight) -> None:
         self.weight = weight.state_dict()
-        # exp_base is also kept as a Python int (a plain attribute, outside the
-        # parameter tree), so calls never evaluate an array: that works under
-        # mx.compile, where the arrays are placeholders.
-        object.__setattr__(self, "_exp_base", weight.exp_base)
         self.freeze()
 
-    def update(self, parameters: dict, strict: bool = True) -> nn.Module:
-        """``nn.Module.update`` (also used by ``load_weights``); re-reads exp_base
-        (one sync) when the weight is replaced."""
-        super().update(parameters, strict)
-        if "weight" in parameters:
-            object.__setattr__(self, "_exp_base", NF12Weight.from_state_dict(self.weight).exp_base)
-        return self
-
     def load_weights(self, file_or_weights, strict: bool = True) -> nn.Module:
-        """``nn.Module.load_weights`` for NF12 checkpoints (e.g. from ``mx.save_safetensors``).
-
-        The escape count differs per weight, so ``weight.*`` arrays are checked
-        as an NF12 weight of this module's shape rather than against the current
-        array shapes. Other arrays (``bias``) must match their current shapes.
-        ``strict`` requires exactly this module's keys."""
-        from mlx.utils import tree_flatten
-
-        weights = dict(mx.load(file_or_weights) if isinstance(file_or_weights, str) else file_or_weights)
-        current = dict(tree_flatten(self.parameters()))
-        if strict and set(weights) != set(current):
-            missing, extra = sorted(set(current) - set(weights)), sorted(set(weights) - set(current))
-            raise ValueError(f"nf12: checkpoint keys do not match the module (missing {missing}, unexpected {extra})")
-        prefix = "weight."
-        nf12 = {key[len(prefix):]: value for key, value in weights.items() if key.startswith(prefix)}
-        if nf12:
-            weight = NF12Weight.from_state_dict(nf12)
-            if weight.shape != self.nf12_weight.shape:
-                raise ValueError(f"nf12: checkpoint weight shape {weight.shape} != module shape {self.nf12_weight.shape}")
-        rest = {key: value for key, value in weights.items() if not key.startswith(prefix) and key in current}
-        for key, value in rest.items():
-            if value.shape != current[key].shape:
-                raise ValueError(f"nf12: {key} has shape {tuple(value.shape)}, expected {tuple(current[key].shape)}")
-        update = {**rest}
-        if nf12:
-            update["weight"] = nf12
-        self.update(update)
-        return self
+        """Loads an NF12 checkpoint into this module; see :func:`load_weights`."""
+        return load_weights(self, file_or_weights, strict)
 
     @property
     def nf12_weight(self) -> NF12Weight:
-        """The current weight, from the module's arrays and the cached exp_base."""
-        return NF12Weight(self.weight[PACKED_KEY], self.weight[ESCAPES_KEY], self._exp_base)
+        """The current weight. Reads exp_base from its array (one sync), so it is
+        for inspection, not for use inside ``mx.compile``."""
+        return NF12Weight.from_state_dict(self.weight)
 
     def _weight_args(self) -> tuple[mx.array, mx.array, mx.array]:
-        # The exp_base array (not the cached int) goes to the kernels as data, so
-        # an mx.compile trace that captured this module's state stays correct
-        # after its weight is replaced by one of the same shape.
+        # exp_base goes to the kernels as an array, so nothing evaluates here
+        # (mx.compile works) and a reused trace sees a replaced weight.
         w = self.weight
         return w[PACKED_KEY], w[ESCAPES_KEY], w[EXP_BASE_KEY]
 
     def _linear(self, x: mx.array, bias: mx.array | None) -> mx.array:
-        _check_input(x, self.nf12_weight.shape[1])
+        _check_input(x, self.weight[PACKED_KEY].shape[1] * 2 // 3)
         return _load().linear(x, *self._weight_args(), bias)
+
+
+def _nf12_modules(model: nn.Module) -> list[tuple[str, _NF12WeightModule]]:
+    """(``weight.`` key prefix, module) for every NF12 module in ``model``."""
+    return [((name + "." if name else "") + "weight.", module)
+            for name, module in model.named_modules() if isinstance(module, _NF12WeightModule)]
+
+
+def escaped_groups(packed: mx.array) -> mx.array:
+    """Number of escaped groups in a packed weight (the groups whose 32-bit meta
+    word is the M == 0 sentinel), lazily; a consistent weight has that many escape rows."""
+    meta = packed.reshape(-1, 3, 128, 4)[:, 0]  # super-atoms of three 512-byte planes; plane 0 holds the meta words
+    return mx.sum(mx.all(meta == 0, axis=-1))
+
+
+def _check_values(checks: list[tuple[str, str, mx.array, int]]) -> list[str]:
+    """Evaluates (name, kind, value, expected) checks together; returns the problems."""
+    mx.eval([value for _, _, value, _ in checks])
+    problems = []
+    for name, kind, value, expected in checks:
+        v = int(value.item())
+        if kind == "exp_base" and not 0 <= v <= 120:
+            problems.append(f"{name}.{EXP_BASE_KEY} is {v}, outside [0, 120]")
+        if kind == "escapes" and v != expected:
+            problems.append(f"{name}: {PACKED_KEY} has {v} escaped groups but {ESCAPES_KEY} has {expected} rows")
+    return problems
+
+
+def load_weights(model: nn.Module, file_or_weights, strict: bool = True) -> nn.Module:
+    """``model.load_weights`` for models containing NF12 modules.
+
+    ``nn.Module.load_weights(strict=True)`` requires every array to keep its
+    current shape, but an NF12 weight's escape count (``nf12_escapes`` rows)
+    differs per weight, so a checkpoint cannot load into a freshly built model
+    that way. This function follows ``nn.Module.load_weights`` (``strict``:
+    exact key set and unchanged shapes; otherwise only the supplied arrays that
+    exist in the model, without shape checks), except that:
+
+    - escape rows may change, and every NF12 weight it touches is checked as the
+      supplied arrays merged with the module's current ones (dtypes, the packed
+      shape, exp_base in [0, 120]); with ``strict=False`` a checkpoint may supply
+      part of a weight, as when one weight's arrays are split across shards;
+    - when a checkpoint supplies a weight's ``nf12_packed`` and ``nf12_escapes``
+      together, they must agree (escaped groups == escape rows), which rejects
+      corrupt or truncated files;
+    - a rejected checkpoint leaves the model unchanged.
+
+    A weight assembled from several partial loads is only consistent once all
+    of its arrays are in; call :func:`verify_weights` after the last one.
+    ``file_or_weights`` is a ``.safetensors``/``.npz`` path or ``(name, array)`` pairs.
+    """
+    from mlx.utils import tree_flatten
+
+    weights = dict(mx.load(file_or_weights) if isinstance(file_or_weights, str) else file_or_weights)
+    current = dict(tree_flatten(model.parameters()))
+    nf12 = _nf12_modules(model)
+    nf12_keys = {prefix + key for prefix, _ in nf12 for key in (PACKED_KEY, ESCAPES_KEY, EXP_BASE_KEY)}
+    if strict:
+        if extra := sorted(weights.keys() - current.keys()):
+            raise ValueError(f"nf12: {len(extra)} parameters not in the model: {extra}")
+        if missing := sorted(current.keys() - weights.keys()):
+            raise ValueError(f"nf12: missing {len(missing)} parameters: {missing}")
+        for key, value in weights.items():
+            if key in nf12_keys:
+                continue  # checked as an NF12 weight below
+            if not isinstance(value, mx.array):
+                raise ValueError(f"nf12: expected mx.array for {key}, got {type(value).__name__}")
+            if value.shape != current[key].shape:
+                raise ValueError(f"nf12: {key} has shape {tuple(value.shape)}, expected {tuple(current[key].shape)}")
+    checks = []
+    for prefix, module in nf12:
+        supplied = {key[len(prefix):]: value for key, value in weights.items() if key.startswith(prefix)}
+        if not supplied:
+            continue
+        name = prefix[:-1]
+        merged = {**module.weight, **supplied}
+        _check_weight_arrays(merged[PACKED_KEY], merged[ESCAPES_KEY], merged[EXP_BASE_KEY], name)
+        want = tuple(module.weight[PACKED_KEY].shape)
+        if tuple(merged[PACKED_KEY].shape) != want:
+            raise ValueError(f"nf12: {name}.{PACKED_KEY} has shape {tuple(merged[PACKED_KEY].shape)}, "
+                             f"but this module's weight is {want}")
+        if EXP_BASE_KEY in supplied:
+            checks.append((name, "exp_base", merged[EXP_BASE_KEY].reshape(1)[0], 0))
+        if PACKED_KEY in supplied and ESCAPES_KEY in supplied:
+            checks.append((name, "escapes", escaped_groups(merged[PACKED_KEY]), merged[ESCAPES_KEY].shape[0]))
+    if problems := _check_values(checks):
+        raise ValueError("nf12: rejected checkpoint: " + "; ".join(problems))
+    # Checked: MLX's non-strict load assigns exactly the supplied arrays that
+    # exist in the model.
+    nn.Module.load_weights(model, [(k, v) for k, v in weights.items() if k in current], strict=False)
+    return model
+
+
+def verify_weights(model: nn.Module) -> None:
+    """Checks every NF12 weight in ``model`` is consistent: its packed array's
+    escaped groups match its escape rows, and exp_base is in [0, 120]. Call it
+    after assembling weights from partial (e.g. sharded) loads. One sync for the
+    whole model; raises ValueError naming each inconsistent weight."""
+    checks = []
+    for prefix, module in _nf12_modules(model):
+        w, name = module.weight, prefix[:-1]
+        _check_weight_arrays(w[PACKED_KEY], w[ESCAPES_KEY], w[EXP_BASE_KEY], name)
+        checks.append((name, "exp_base", w[EXP_BASE_KEY].reshape(1)[0], 0))
+        checks.append((name, "escapes", escaped_groups(w[PACKED_KEY]), w[ESCAPES_KEY].shape[0]))
+    if problems := _check_values(checks):
+        raise ValueError("nf12: NF12 weights failed verification: " + "; ".join(problems))
 
 
 class NF12Linear(_NF12WeightModule):
