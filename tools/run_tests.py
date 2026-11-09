@@ -33,7 +33,10 @@ MOE_SUITES = ["tests/api/test_moe.py", "tests/mlx"]
 
 def configurations(quick: bool) -> list[tuple[str, list[str], dict[str, str]]]:
     if platform.system() == "Darwin":
-        runs = [("all suites, default routes", PYTEST, {})]
+        runs = [("all suites, default routes", PYTEST, {}),
+                # Metal API validation: contract violations (e.g. misaligned buffer
+                # offsets) that give right answers on one GPU and wrong ones on another.
+                ("Metal API validation", PYTEST, {"MTL_DEBUG_LAYER": "1"})]
         if not quick:
             runs += [(f"NF12_MPS_LINEAR={r}", PYTEST + LINEAR_SUITES, {"NF12_MPS_LINEAR": r})
                      for r in ("small", "mma", "gemm", "decode")]
@@ -59,7 +62,9 @@ def main() -> int:
     results = []
     for name, command, env in configurations(args.quick):
         start = time.perf_counter()
-        proc = subprocess.run(command, cwd=ROOT, env={**os.environ, **env}, capture_output=True, text=True)
+        # Each configuration sets its own routes: drop any the caller exported.
+        base = {k: v for k, v in os.environ.items() if not k.startswith(("NF12_MPS_", "MTL_DEBUG"))}
+        proc = subprocess.run(command, cwd=ROOT, env={**base, **env}, capture_output=True, text=True)
         output = proc.stdout + proc.stderr
         elapsed = time.perf_counter() - start
         if command[1:3] == ["-m", "pytest"]:

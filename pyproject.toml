@@ -1,13 +1,8 @@
 [build-system]
-# On Apple silicon the MLX extension is built too. MLX has no stable C++ ABI and
-# its Python bindings share nanobind state only with the same nanobind ABI, so
-# the pair is pinned; nf12.mlx rebuilds for other MLX versions at first use.
-requires = [
-  "scikit-build-core>=0.10",
-  "torch>=2.10",
-  "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "nanobind==3.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
+# The MLX extension (macOS) is built when the build environment has mlx and
+# nanobind (NF12_BUILD_MLX=AUTO); otherwise nf12.mlx builds it on first use.
+# They are not build requirements, so torch-only and offline builds never need them.
+requires = ["scikit-build-core>=0.10", "torch>=2.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -30,6 +25,15 @@ mlx = [
 [dependency-groups]
 test = ["pytest", "numpy", "safetensors"]
 bench = ["huggingface-hub", "numpy", "safetensors"]
+
+# uv builds (development) include the MLX extension. MLX has no stable C++ ABI
+# and its Python bindings share nanobind state only with the same nanobind ABI,
+# so the pair is pinned; nf12.mlx rebuilds for another installed MLX at first use.
+[tool.uv.extra-build-dependencies]
+nf12 = [
+  "mlx==0.32.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "nanobind==3.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [tool.uv]
 # Rebuild native libraries when sources or the target architectures change.

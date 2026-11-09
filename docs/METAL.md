@@ -85,8 +85,9 @@ copy in the JIT cache (`~/.cache/nf12/<key>/build`) on first use:
   rebuild is MLX-only and does not need torch. It needs the nanobind version the
   installed MLX uses: MLX's bindings share nanobind state, and so accept `mx.array`
   arguments, only with the same nanobind ABI. `nf12.mlx` checks this when it loads
-  the module and names the mismatch instead of failing every call. The wheel's build
-  requirements pin MLX 0.32.4 with nanobind 3.1.0.
+  the module and names the mismatch instead of failing every call. uv builds
+  (`[tool.uv.extra-build-dependencies]`) pin MLX 0.32.4 with nanobind 3.1.0; other
+  installers build the module on first use, so mlx is never a build requirement.
 
 A macOS wheel is CPython specific because of the MLX module.
 
@@ -244,4 +245,8 @@ running it against the unfixed code.
   The `mlx.nn` modules work under `mx.compile` with their state captured: a dense
   weight's `exp_base` reaches the kernels as an array, so a reused trace stays correct
   after the weight is replaced, however it is replaced (an update or load on the
-  module or on any parent). The package still depends on PyTorch.
+  module or on any parent). `mx.compile(..., shapeless=True)` is not supported:
+  the kernels are specialized to the input's row count, so it fails with
+  `cannot infer output shapes`. Inputs must start 4-byte aligned (16 for packed
+  weights); a row-contiguous slice at an odd offset is rejected when evaluated,
+  so copy it first (`mx.array(x)`). The package still depends on PyTorch.

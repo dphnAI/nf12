@@ -140,7 +140,7 @@ inline void linear_gemm(Src src, device const ushort* x, device const ushort* bi
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],                          \
       device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],                                      \
-      constant uchar* exp_base [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],                           \
+      device const uchar* exp_base [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],                           \
       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],                         \
       uint tid [[thread_index_in_threadgroup]], uint2 threads [[threads_per_threadgroup]]) {                       \
     threadgroup float part[kSmallMaxSimdgroups * kSmallMaxMT * 16];                                                \
@@ -165,7 +165,7 @@ NF12_SMALL_KERNEL(8)
 kernel void nf12_linear_gemm_nf12(device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],
                                   device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],
                                   device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],
-                                  constant uchar* exp_base [[buffer(6)]],
+                                  device const uchar* exp_base [[buffer(6)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint sg [[simdgroup_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
@@ -192,7 +192,7 @@ kernel void nf12_linear_gemm_bf16t(device const ushort* x [[buffer(0)]], device 
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],                          \
       device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],                                      \
-      constant uchar* exp_base [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],                           \
+      device const uchar* exp_base [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],                           \
       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],                         \
       uint tid [[thread_index_in_threadgroup]], uint2 threads [[threads_per_threadgroup]]) {                       \
     threadgroup float part[kMmaMaxSimdgroups * 16 * 8 * MB];                                                       \

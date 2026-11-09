@@ -50,7 +50,9 @@ def _load():
         if ext is None or getattr(ext, "mlx_version", None) != mx.__version__:
             from ._jit import mlx_library_directory
 
-            path = mlx_library_directory() / _extension_filename()
+            from ._jit import _MLX_LIBRARIES
+
+            path = mlx_library_directory() / _MLX_LIBRARIES[0]
             spec = importlib.util.spec_from_file_location("nf12._mlx_ext", path)
             ext = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(ext)
@@ -65,12 +67,6 @@ def _load():
             ) from error
         _ext = ext
         return _ext
-
-
-def _extension_filename() -> str:
-    import sysconfig
-
-    return "_mlx_ext" + sysconfig.get_config_var("EXT_SUFFIX")
 
 
 def check_weight_shape(n: int, k: int) -> None:
@@ -157,9 +153,13 @@ class NF12Weight:
 
 
 def encode(w: mx.array) -> NF12Weight:
-    """Losslessly encodes a ``[N, K]`` bf16 matrix. Evaluates ``w`` and synchronizes."""
+    """Losslessly encodes a ``[N, K]`` bf16 matrix. Evaluates the result (so the
+    encoding is not recomputed by later graphs, e.g. under ``mx.compile``, and the
+    bf16 source can be freed) and synchronizes."""
     _check_bf16_matrix(w, "weight")
-    return NF12Weight(*_load().encode(w))
+    packed, escapes, exp_base = _load().encode(w)
+    mx.eval(packed, escapes)
+    return NF12Weight(packed, escapes, exp_base)
 
 
 def decode(weight: NF12Weight) -> mx.array:
@@ -285,9 +285,12 @@ def _check_experts(w: mx.array) -> None:
 
 
 def encode_moe(w: mx.array) -> NF12MoEWeight:
-    """Losslessly encodes stacked ``[E, N, K]`` bf16 experts. Synchronizes."""
+    """Losslessly encodes stacked ``[E, N, K]`` bf16 experts. Evaluates the result
+    and synchronizes."""
     _check_experts(w)
-    return NF12MoEWeight(*_load().encode_moe(w))
+    arrays = _load().encode_moe(w)
+    mx.eval(*arrays)
+    return NF12MoEWeight(*arrays)
 
 
 def pack_bf16t_moe(w: mx.array) -> mx.array:

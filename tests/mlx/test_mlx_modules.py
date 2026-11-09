@@ -361,3 +361,46 @@ def test_top_level_verify_weights_routes_mlx_models():
         nf12.verify_weights(net)
     with pytest.raises(TypeError):
         nf12.verify_weights(object())
+
+
+def test_encode_is_evaluated(tmp_path):
+    """encode evaluates its result: a compiled model built from unevaluated
+    weights must not re-run the encoder on every call."""
+    mx.random.seed(3)
+    lin = mnn.Linear(128, 48, bias=False)
+    lin.set_dtype(mx.bfloat16)
+    layer = nm.NF12Linear.from_linear(lin)
+    f = mx.compile(layer)
+    out = f(INPUTS[0])
+    dot = tmp_path / "graph.dot"
+    mx.export_to_dot(str(dot), out)
+    assert "encode" not in dot.read_text()
+
+
+def test_narrowed_moe_weight():
+    w = randn(8, 128, 128, seed=1, scale=0.05)
+    mw = nm.encode_moe(to_mlx(w))
+    for start in range(1, 7):
+        assert bits_equal(mw.narrow(start, 2).decode(), to_mlx(w[start:start + 2]))
+
+
+def test_bias_at_odd_offset():
+    a, _, _ = weight_sets()
+    full = to_mlx(randn(49, seed=7))
+    bias = full[1:]  # starts at an odd bf16 element
+    x = INPUTS[0]
+    assert bits_equal(nm.linear(x, a["proj"], bias), nm.linear(x, a["proj"], mx.array(bias)))
+
+
+def test_decode_route_slices_match(monkeypatch):
+    """The large-M decode route decodes bounded row slices; results equal the
+    whole-weight decode (1 MiB slices force several)."""
+    monkeypatch.setenv("NF12_MPS_LINEAR", "decode")  # the route under test, whatever the matrix forces
+    w = randn(2048, 1024, seed=8, scale=0.02)
+    w[5, :8] = 1e30
+    nw = nm.encode(to_mlx(w))
+    x, b = to_mlx(randn(40, 1024, seed=9)), to_mlx(randn(2048, seed=10))
+    whole = nm.linear(x, nw, b)
+    monkeypatch.setenv("NF12_MPS_DECODE_SLICE_MB", "1")
+    assert bits_equal(nm.linear(x, nw, b), whole)
+    assert bits_equal(whole, mx.addmm(b, x, nw.decode().T))

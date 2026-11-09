@@ -57,7 +57,12 @@ _EXPORTS = {
 __all__ = sorted(_EXPORTS)
 
 
+_SUBMODULES = {"api", "moe", "nn", "reference", "mlx"}
+
+
 def __getattr__(name: str):
+    if name in _SUBMODULES:  # nf12.nn etc. after a plain `import nf12`
+        return importlib.import_module(f".{name}", __name__)
     module = _EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module 'nf12' has no attribute {name!r}")
@@ -67,4 +72,4 @@ def __getattr__(name: str):
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(_EXPORTS))
+    return sorted(set(globals()) | set(_EXPORTS) | _SUBMODULES)

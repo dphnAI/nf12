@@ -7,6 +7,7 @@ Nothing is loaded at ``import nf12`` time, so pure-Python modules such as
 
 from __future__ import annotations
 
+import functools
 import sys
 import threading
 from pathlib import Path
@@ -76,8 +77,33 @@ def load() -> None:
         _loaded = True
 
 
+def _same_device(op: str, values) -> None:
+    devices = {v.device for v in values if isinstance(v, torch.Tensor)}
+    if len(devices) > 1:
+        raise RuntimeError(f"nf12::{op}: tensors are on different devices ({', '.join(sorted(map(str, devices)))}); "
+                           "is a module's weight still on the meta device (not loaded)?")
+
+
+def _fake(op: str):
+    """register_fake for nf12::op, rejecting tensors on different devices first.
+
+    The fake also serves as the Meta kernel, and dispatch picks it when any
+    argument is a meta tensor: without the check, a module whose weight is still
+    on the meta device would return uninitialized memory for a real input."""
+    def register(fn):
+        @functools.wraps(fn)
+        def checked(*args, **kwargs):
+            _same_device(op, (*args, *kwargs.values()))
+            return fn(*args, **kwargs)
+
+        torch.library.register_fake(f"nf12::{op}")(checked)
+        return fn
+
+    return register
+
+
 def _register_fakes() -> None:
-    @torch.library.register_fake("nf12::encode")
+    @_fake("encode")
     def _encode(w):
         ctx = torch.library.get_ctx()
         n, k = w.shape
@@ -85,29 +111,29 @@ def _register_fakes() -> None:
         escapes = w.new_empty((ctx.new_dynamic_size(), 8), dtype=torch.int16)
         return packed, escapes, ctx.new_dynamic_size(min=0, max=120)
 
-    @torch.library.register_fake("nf12::decode")
+    @_fake("decode")
     def _decode(packed, escapes, exp_base):
         n, row_bytes = packed.shape
         return packed.new_empty((n, row_bytes * 2 // 3), dtype=torch.bfloat16)
 
-    @torch.library.register_fake("nf12::linear")
+    @_fake("linear")
     def _linear(x, packed, escapes, exp_base, bias=None):
         return x.new_empty((*x.shape[:-1], packed.shape[0]))
 
-    @torch.library.register_fake("nf12::pack_bf16t")
+    @_fake("pack_bf16t")
     def _pack_bf16t(w):
         n, k = w.shape
         return w.new_empty((n, 2 * k), dtype=torch.uint8)
 
-    @torch.library.register_fake("nf12::linear_bf16t")
+    @_fake("linear_bf16t")
     def _linear_bf16t(x, w_bf16t, bias=None):
         return x.new_empty((*x.shape[:-1], w_bf16t.shape[0]))
 
-    @torch.library.register_fake("nf12::embedding")
+    @_fake("embedding")
     def _embedding(ids, packed, escapes, exp_base):
         return packed.new_empty((*ids.shape, packed.shape[1] * 2 // 3), dtype=torch.bfloat16)
 
-    @torch.library.register_fake("nf12::encode_moe")
+    @_fake("encode_moe")
     def _encode_moe(w):
         ctx = torch.library.get_ctx()
         e, n, k = w.shape
@@ -115,12 +141,12 @@ def _register_fakes() -> None:
         escapes = w.new_empty((ctx.new_dynamic_size(), 8), dtype=torch.int16)
         return packed, escapes, w.new_empty((e + 1,), dtype=torch.int64), w.new_empty((e,), dtype=torch.uint8)
 
-    @torch.library.register_fake("nf12::moe_align")
+    @_fake("moe_align")
     def _moe_align(topk_ids, num_experts):
         return (topk_ids.new_empty((topk_ids.numel(),), dtype=torch.int32),
                 topk_ids.new_empty((num_experts + 1,), dtype=torch.int64))
 
-    @torch.library.register_fake("nf12::moe_decode")
+    @_fake("moe_decode")
     def _moe_decode(packed, escapes, escape_offsets, exp_base):
         e, n, row_bytes = packed.shape
         return packed.new_empty((e, n, row_bytes * 2 // 3), dtype=torch.bfloat16)
@@ -128,25 +154,25 @@ def _register_fakes() -> None:
     def _moe_rows(x, gather, scatter):
         return gather.shape[0] if gather is not None else scatter.shape[0] if scatter is not None else x.shape[0]
 
-    @torch.library.register_fake("nf12::moe_linear")
+    @_fake("moe_linear")
     def _moe_linear(x, packed, escapes, escape_offsets, exp_base, expert_offsets, gather=None, gather_div=1,
                     scatter=None, row_scale=None, zero_fill=False):
         return x.new_empty((_moe_rows(x, gather, scatter), packed.shape[1]))
 
-    @torch.library.register_fake("nf12::moe_linear_bf16t")
+    @_fake("moe_linear_bf16t")
     def _moe_linear_bf16t(x, w_bf16t, expert_offsets, gather=None, gather_div=1, scatter=None, row_scale=None,
                           zero_fill=False):
         return x.new_empty((_moe_rows(x, gather, scatter), w_bf16t.shape[1]))
 
-    @torch.library.register_fake("nf12::moe_combine")
+    @_fake("moe_combine")
     def _moe_combine(y, topk):
         return y.new_empty((y.shape[0] // topk, y.shape[1]))
 
-    @torch.library.register_fake("nf12::moe_silu_mul")
+    @_fake("moe_silu_mul")
     def _moe_silu_mul(h):
         return h.new_empty((h.shape[0], h.shape[1] // 2))
 
-    @torch.library.register_fake("nf12::_fused_moe")
+    @_fake("_fused_moe")
     def _fused_moe(x, packed13, escapes13, escape_offsets13, exp_base13,
                    packed2, escapes2, escape_offsets2, exp_base2, topk_weights, topk_ids, zero_fill=False):
         return x.new_empty((x.shape[0], packed2.shape[1]))

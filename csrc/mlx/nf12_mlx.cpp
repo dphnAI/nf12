@@ -99,7 +99,8 @@ class Kernel : public mx::Primitive {
       // Packed weights and escapes are read as 16-byte vectors, bf16 as pairs.
       const auto address = reinterpret_cast<uintptr_t>(a.data<char>());
       const bool vectors = (a.dtype() == mx::uint8 || a.dtype() == mx::int16) && a.ndim() >= 2;
-      const uintptr_t need = vectors ? 16 : a.dtype() == mx::bfloat16 ? 4 : a.itemsize();
+      // bf16 matrices are read as element pairs; a 1-D bf16 bias as single elements.
+      const uintptr_t need = vectors ? 16 : a.dtype() == mx::bfloat16 ? (a.ndim() >= 2 ? 4 : 2) : a.itemsize();
       if (a.nbytes() > 0 && address % need != 0)
         throw std::invalid_argument(std::string("nf12.") + name_ +
                                     ": operands must be aligned (copy sliced inputs with mx.array(x))");
@@ -107,8 +108,9 @@ class Kernel : public mx::Primitive {
     for (array& out : outputs) out.set_data(mx::allocator::malloc(out.nbytes()));
     const mx::Stream& s = stream();
     mx::metal::Device& d = mx::metal::device(s.device);
-    MTL::Library* lib = d.get_library("nf12", metallib_path());
-    if (lib == nullptr) throw std::runtime_error("nf12: failed to load " + metallib_path());
+    static const std::string path = metallib_path();  // fixed for the process
+    MTL::Library* lib = d.get_library("nf12", path);
+    if (lib == nullptr) throw std::runtime_error("nf12: failed to load " + path);
     MlxEncoder e{d, mx::metal::get_command_encoder(s), lib};
     body_(e, inputs, outputs);
   }
@@ -341,9 +343,27 @@ array run_linear(const array& x, const array& packed, int64_t n, int64_t k, cons
   const Route route = linear_route(m, nf12);
   array y = [&]() -> array {
     if (route == Route::kDecode) {
-      // Decode-then-GEMM (SPEC.md 6.5): MLX's matmul on the decoded weight.
-      const array wt = mx::transpose(decode_view(*nf12_view), s);
-      return bias ? mx::addmm(*bias, x2, wt, 1.0f, 1.0f, s) : mx::matmul(x2, wt, s);
+      // Decode-then-GEMM (SPEC.md 6.5): MLX's matmul on decoded row slices of at
+      // most decode_slice_bytes() (as on MPS), so a large weight never exists
+      // decoded in full. Escapes are indexed absolutely, so slices share them.
+      auto gemm = [&](const WeightView& w, const optional<array>& b) {
+        const array wt = mx::transpose(decode_view(w), s);
+        return b ? mx::addmm(*b, x2, wt, 1.0f, 1.0f, s) : mx::matmul(x2, wt, s);
+      };
+      const int64_t rows = decode_slice_rows(n, k);
+      if (rows >= n) return gemm(*nf12_view, bias);
+      const int cols = int(nf12_view->packed.shape(1));
+      std::vector<array> parts;
+      for (int64_t n0 = 0; n0 < n; n0 += rows) {
+        const int64_t r = std::min(rows, n - n0);
+        WeightView slice = *nf12_view;
+        slice.packed = mx::slice(nf12_view->packed, {int(n0), 0}, {int(n0 + r), cols}, s);
+        slice.n = r;
+        optional<array> b;
+        if (bias) b = mx::slice(*bias, {int(n0)}, {int(n0 + r)}, s);
+        parts.push_back(gemm(slice, b));
+      }
+      return mx::concatenate(parts, 1, s);
     }
     std::vector<array> inputs{x2, packed};
     const WeightInputs wi = nf12 ? add_weight_inputs(*nf12_view, inputs) : WeightInputs{};

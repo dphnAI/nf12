@@ -157,7 +157,7 @@ struct ExpertNF12 {
   device const uint4* packed;
   device const uint4* escapes;
   constant long* escape_offsets;
-  constant uchar* exp_base;
+  device const uchar* exp_base;
   inline NF12Source source(uint e, ulong expert_super_atoms) const {
     return NF12Source{packed + ulong(e) * expert_super_atoms * (kSuperAtomBytes / 16), escapes + escape_offsets[e],
                       exp_base_x4(exp_base[e])};
@@ -301,7 +301,7 @@ inline void moe_gemm(Experts experts, device const ushort* x, MoeRows rows, devi
       uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]
 #define NF12_MOE_NF12_ARGS                                                                                       \
   device const uint4 *escapes [[buffer(2)]], constant long *escape_offsets [[buffer(3)]],                        \
-      constant uchar *exp_base [[buffer(4)]]
+      device const uchar *exp_base [[buffer(4)]]
 
 #define NF12_MOE_SMALL(MT)                                                                                       \
   kernel void nf12_moe_small_nf12_m##MT(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS,                                       \

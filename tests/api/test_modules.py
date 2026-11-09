@@ -263,3 +263,44 @@ def test_checkpoint_tensors_at_odd_offsets(sets):
         sd[key] = buf[1:].view(sd[key].shape)  # storage offset 1
     net.load_state_dict(sd)
     assert_holds(net, esc)
+
+
+@pytest.mark.parametrize("m", [3, 40])  # 40 takes the decode-then-matmul route on MPS
+def test_autocast_does_not_change_results(m):
+    """The op's internal matmul must not be retyped by the caller's autocast region."""
+    torch.manual_seed(0)
+    lin = nn.Linear(128, 64).to(DEV, torch.bfloat16)
+    with torch.no_grad():
+        lin.weight[0, 0] = 1e6  # overflows fp16
+    layer = nf12.NF12Linear.from_linear(lin)
+    x = randn(m, 128, seed=4, device=DEV)
+    plain = layer(x)
+    with torch.autocast(DEV, dtype=torch.float16):
+        cast = layer(x)
+    assert bits_equal(cast, plain)
+
+
+def test_unloaded_meta_module_raises():
+    """A module whose weight is still on the meta device must not return
+    uninitialized memory for a real input."""
+    layer = nf12.NF12Linear(128, 64, bias=False, device="meta")
+    with pytest.raises(RuntimeError, match="different devices"):
+        layer(randn(2, 128, seed=5, device=DEV))
+    assert layer(torch.empty(3, 128, device="meta", dtype=torch.bfloat16)).shape == (3, 64)  # shape inference
+
+
+def test_narrowed_moe_weight():
+    """narrow() gives views whose per-expert exp_base starts at any byte offset;
+    kernels must accept that (run under MTL_DEBUG_LAYER=1 by tools/run_tests.py)."""
+    w = randn(8, 128, 128, seed=1, scale=0.05, device=DEV)
+    mw = nf12.encode_moe(w)
+    for start in range(1, 7):
+        assert bits_equal(mw.narrow(start, 2).decode(), w[start:start + 2])
+    x = randn(5, 128, seed=2, device=DEV)
+    ids = torch.tensor([[2, 3]] * 5, dtype=torch.int32, device=DEV)
+    w2 = randn(8, 128, 64, seed=3, scale=0.05, device=DEV)
+    m2 = nf12.encode_moe(w2)
+    weights = torch.full((5, 2), 0.5, device=DEV)
+    y = nf12.fused_moe(x, mw.narrow(1, 6), m2.narrow(1, 6), weights, ids)
+    ref = nf12.fused_moe(x, nf12.encode_moe(w[1:7].contiguous()), nf12.encode_moe(w2[1:7].contiguous()), weights, ids)
+    assert bits_equal(y, ref)

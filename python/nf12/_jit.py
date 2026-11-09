@@ -24,6 +24,8 @@ _MLX_LIBRARIES = ("_mlx_ext" + (sysconfig.get_config_var("EXT_SUFFIX") or ".so")
 _BUILD_ENV = (
     "CUDACXX", "CUDA_HOME", "CUDA_PATH", "CUDAHOSTCXX", "CXX", "CXXFLAGS",
     "CUDAFLAGS", "LDFLAGS", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS",
+    # macOS: the Metal and Objective-C++ toolchain.
+    "CPPFLAGS", "OBJCXX", "OBJCXXFLAGS", "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
 )
 _lock = threading.Lock()
 _directory: Path | None = None

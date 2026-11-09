@@ -5,6 +5,7 @@
 // encoder, so they order with surrounding torch work without extra syncs.
 #include <ATen/ATen.h>
 #include <ATen/mps/MPSStream.h>
+#include <c10/core/impl/LocalDispatchKeySet.h>
 #include <torch/library.h>
 
 #import <Foundation/Foundation.h>
@@ -269,10 +270,17 @@ void decode_gemm(const WeightView& w, const Tensor& x2, const std::optional<Tens
     run([&](TorchEncoder& e) {
       launch_decode(e, slice, nonempty(w.escapes), nullptr, Base{nullptr, w.exp_base}, 1, r, w.k, wd, w.k);
     });
-    Tensor ys = bias.has_value() ? at::addmm(bias->narrow(0, n0, r), x2, wd.t()) : at::mm(x2, wd.t());
-    if (r == w.n) {
-      y2.copy_(ys);
+    // This matmul is part of the op, not the caller's code: autocast must not
+    // retype it (an fp16 autocast region would overflow the BF16 result).
+    c10::impl::ExcludeDispatchKeyGuard no_autocast(c10::autocast_dispatch_keyset);
+    if (r == w.n) {  // one slice: write the (contiguous) output directly
+      if (bias.has_value()) {
+        at::addmm_out(y2, *bias, x2, wd.t());
+      } else {
+        at::mm_out(y2, x2, wd.t());
+      }
     } else {
+      Tensor ys = bias.has_value() ? at::addmm(bias->narrow(0, n0, r), x2, wd.t()) : at::mm(x2, wd.t());
       y2.narrow(1, n0, r).copy_(ys);
     }
   }
