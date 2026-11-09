@@ -461,7 +461,7 @@ def test_load_weights_nf12_checkpoint(tmp_path):
     x = activations(4, 128)
     assert_bitwise(fresh(x), src(x))
     assert fresh.nf12_weight.exp_base == src.nf12_weight.exp_base
-    with pytest.raises(ValueError, match="do not match"):
+    with pytest.raises(ValueError, match="not in the model"):
         nm.NF12Linear(128, 48, bias=False).load_weights(path)
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="this module's weight is"):  # wrong shape for this module
         nm.NF12Linear(64, 48).load_weights(path)

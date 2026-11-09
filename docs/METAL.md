@@ -21,7 +21,24 @@ nw = nm.encode(w)                      # w: bf16 [N, K]; synchronizes once
 y = nm.linear(x, nw, bias)             # lazy, like any MLX op
 layer = nm.NF12Linear.from_linear(lin) # mlx.nn.Linear -> NF12
 mx.save_safetensors("w.safetensors", nw.state_dict("w."))
+nm.load_weights(model, "model.safetensors")  # a model containing NF12 modules
 ```
+
+Load NF12 checkpoints into a model with `nm.load_weights(model, ...)`, not
+`model.load_weights(...)`. MLX's strict load requires every array to keep its
+shape, but the number of escape rows differs per weight. `nm.load_weights`
+makes the same checks except for that, and leaves the model unchanged if it
+rejects the checkpoint (wrong dtypes or shapes, exp_base out of range, or a
+weight whose packed array and escape rows disagree).
+
+With `strict=False` a checkpoint may supply part of a weight, as when one
+weight's tensors are split across shards: supplied entries merge with the
+current ones (in PyTorch, `load_state_dict(strict=False)` does the same). Such a
+weight is only consistent once all of its tensors are loaded, so after the last
+shard call `nm.verify_weights(model)` (or `nf12.verify_weights(model)`, which
+handles both frameworks). It checks every NF12 weight with one sync, and in
+PyTorch also reports weights still on the meta device: a module built on meta
+needs all three of a weight's tensors in one `load_state_dict` call.
 
 ## Requirements
 
@@ -187,6 +204,32 @@ MLX (`nf12.mlx.linear` against `x @ w.T` in bf16, same shape, 30 independent ops
 bytes-only BF16 floor of about 69 µs (75 MB of active experts at 550 GB/s), so the
 small-T MoE path still has headroom; see below.
 
+## Testing
+
+`tools/run_tests.py` runs the whole matrix for the machine it is on and prints a
+summary. On macOS that is every suite (PyTorch MPS and MLX), then the suites under
+each forced route. On Linux it is the CUDA API suite and the release smoke load. A
+configuration that runs no tests fails. Changes are tested on every supported
+platform before they are pushed: an Apple silicon Mac, a CUDA x86-64 machine and a
+CUDA aarch64 machine (for example an RTX 5090 host and a DGX Spark).
+
+What the suites check:
+
+- **Kernels against references:** codec bytes equal `nf12.reference`, NF12 output
+  equals the bf16t twin bit for bit, and MLX output equals MPS output bit for bit.
+- **Module state** (`tests/api/test_modules.py`, `tests/mlx/test_mlx_modules.py`):
+  NF12 modules inside parent models get their weights replaced through every loading
+  path users take (a parent's or a child's update or load, files, partial and rejected
+  checkpoints). After each, every observable is checked: the forward pass, the weight
+  and its decode, a compiled forward captured beforehand, and a save/reload. Testing
+  module methods directly missed paths that never call them.
+- **Cross-framework checkpoints:** a checkpoint saved by either framework's modules
+  loads into the other's with bit-identical outputs.
+
+Test data comes from `tests/portable_random.py`, so it is bit-identical on every
+machine and device. A new test should fail on the code it guards; check that by
+running it against the unfixed code.
+
 ## Limitations and next steps
 
 - Medium and large M are bounded by FP32 `simdgroup_matrix` throughput. Metal 4
@@ -200,5 +243,5 @@ small-T MoE path still has headroom; see below.
 - MLX: ops have no `vjp`/`vmap` (inference only) and run on the GPU stream only.
   The `mlx.nn` modules work under `mx.compile` with their state captured: a dense
   weight's `exp_base` reaches the kernels as an array, so a reused trace stays correct
-  after the weight is replaced. Their `load_weights` accepts NF12 checkpoints, whose
-  escape counts differ per weight. The package still depends on PyTorch.
+  after the weight is replaced, however it is replaced (an update or load on the
+  module or on any parent). The package still depends on PyTorch.
