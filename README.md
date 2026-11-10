@@ -4,15 +4,17 @@ NF12 is a lossless, fixed-length 12-bit encoding of BF16 weight matrices,
 based on "NyoomFloat12: Accelerating LLM Inference via Lossless 12-bit Weight
 Compression" (Liberman, Fang, Zhang, Dao, Fu, Together AI, 2026). This library
 implements this data type efficiently on NVIDIA GPUs, from the Ampere generation
-up until Blackwell.
+up until Blackwell, and on AMD RDNA4 (`gfx1200` / `gfx1201`) via HIP.
 
 This library's bit and memory layout (tiled) are not compatible with the one
 described in the paper. You can read [the spec](docs/SPEC.md) for more info on the format.
 
 ## Requirements
 
-- NVIDIA GPU with SM80 or newer (Ampere and later).
-- CUDA toolkit 13.0+, a C++ compiler, CMake 3.26+, and Ninja for builds.
+- NVIDIA GPU with SM80 or newer (Ampere and later), **or** an AMD RDNA4 GPU
+  (`gfx1200` / `gfx1201`) for the HIP kernels.
+- CUDA toolkit 13.0+, a C++ compiler, CMake 3.26+, and Ninja for builds. The
+  ROCm path needs only `amdclang++` from the ROCm toolkit — no CUDA.
 - uv for Python environment management and builds.
 - Python 3.10+ and CUDA-enabled PyTorch 2.10+ for the Python package.
 - Weight shapes: `N` (out_features) a multiple of 16, `K` (in_features) a
@@ -46,6 +48,46 @@ You can build the C library alone with CMake:
 cmake -B build/c -G Ninja -DNF12_BUILD_TORCH=OFF -DNF12_CUDA_ARCHS=120
 cmake --build build/c
 ```
+
+## AMD RDNA4 (ROCm)
+
+The HIP backend supports `gfx1200` and `gfx1201` with a
+[C API](include/nf12/nf12_hip.h), and the full `python/nf12` /
+`torch.ops.nf12` API: the torch extension compiles the *same*
+`csrc/torch/ops.cpp` as the CUDA build and backs it with the HIP kernels, so
+there is one op layer rather than a second ROCm implementation. That covers
+encode/decode, `linear` (including the bf16t twin), `pack_bf16t`, `embedding`
+and the whole MoE op set (`moe_align`, `moe_linear`, `moe_combine`,
+`moe_silu_mul`, `moe_decode`, `_fused_moe`). `_fused_moe` at `T == 1` takes a
+native two-kernel fused route instead of the composed one; see
+[`csrc/hip/README.md`](csrc/hip/README.md).
+
+Validated on **ROCm 10.1.0 with HIP 7.16.26385** on Radeon AI PRO R9700
+(`gfx1201`). See the [validated toolchain and test instructions](tests/hip/README.md).
+
+Build from source with the ROCm toolkit, a C++ compiler, CMake 3.26+ and Ninja.
+
+```bash
+cmake -S . -B build/hip -G Ninja \
+  -DNF12_ENABLE_HIP=ON -DNF12_BUILD_TORCH=ON \
+  -DNF12_HIP_ARCHS=gfx1201 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++
+cmake --build build/hip --target nf12_torch
+```
+
+Use `-DNF12_HIP_ARCHS=gfx1200` for a `gfx1200` GPU. To build only the C library,
+set `-DNF12_BUILD_TORCH=OFF` and build `--target nf12_hip`. On a ROCm host,
+`nf12._jit` automatically builds both libraries from a source checkout.
+
+Fused linear kernels support batches of 1–256 tokens. For larger batches,
+the torch API decodes bounded slices and runs BF16 GEMMs; the raw C API
+uses native M chunks with caller-owned workspace. See the
+[ROCm validation report](docs/ROCM_VALIDATION.md) for measured performance.
+
+See the [shared ABI design](docs/ABI_BACKENDS.md) for the CUDA/HIP boundary.
+
+See the [HIP documentation](csrc/hip/README.md) for R9700 benchmark results
+and kernel implementation details.
 
 ## Python
 

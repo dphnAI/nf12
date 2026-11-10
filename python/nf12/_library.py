@@ -18,16 +18,22 @@ _lock = threading.Lock()
 _loaded = False
 
 
-def library_path(name: str = "libnf12.so") -> Path:
+def _native_library_name() -> str:
+    """The C library for this backend."""
+    return "libnf12_hip.so" if torch.version.hip is not None else "libnf12.so"
+
+
+def library_path(name: str | None = None) -> Path:
     """Find a packaged native library, or build and cache it for visible GPUs."""
+    name = _native_library_name() if name is None else name
     # Editable installs put the native install tree before the Python source tree.
     for directory in nf12.__path__:
         candidate = Path(directory) / name
         if candidate.is_file():
-            if name == "libnf12_torch.so" and not candidate.with_name("libnf12.so").is_file():
+            if name == "libnf12_torch.so" and not candidate.with_name(_native_library_name()).is_file():
                 continue
             return candidate
-    if name in ("libnf12.so", "libnf12_torch.so"):
+    if name in ("libnf12.so", "libnf12_torch.so", "libnf12_hip.so"):
         from ._jit import library_directory
 
         return library_directory() / name
@@ -37,6 +43,14 @@ def library_path(name: str = "libnf12.so") -> Path:
 def load() -> None:
     """Idempotently loads the torch extension (``torch.ops.nf12``) on first use."""
     global _loaded
+    # The fast path must stay outside the lock. Dynamo cannot enter a `lock`
+    # context manager, and `torch.compile(fullgraph=True)` turns that into an
+    # error, so a compiled frame has to trace straight through the `_loaded`
+    # check. This is double-checked locking: under a free-threaded (GIL=0)
+    # build two threads can pass the outer check together, but only the first
+    # one to take the lock registers the extension; the second sees `_loaded`
+    # inside the lock and returns. Registering twice is the unsafe outcome,
+    # not entering the lock twice.
     if _loaded:
         return
     with _lock:

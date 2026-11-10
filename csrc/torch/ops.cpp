@@ -51,8 +51,8 @@ Tensor byte_buffer(const Tensor& like, size_t bytes) {
 // A single row does not constrain the row stride.
 Tensor vector_rows(const Tensor& t) {
   auto ok = [](const Tensor& v) {
-    return v.stride(1) == 1 && (v.size(0) <= 1 || (v.stride(0) % 8 == 0 && v.stride(0) >= v.size(1))) &&
-           aligned16(v.data_ptr());
+    const bool rows = v.size(0) <= 1 || (v.stride(0) % 8 == 0 && v.stride(0) >= v.size(1));
+    return v.stride(1) == 1 && rows && aligned16(v.data_ptr());
   };
   if (ok(t)) return t;
   Tensor c = torch::stable::contiguous(t);
