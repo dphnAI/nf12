@@ -6,12 +6,12 @@ from __future__ import annotations
 import ctypes
 import functools
 
+import nf12
 import pytest
 import torch
-from torch import nn
-
-import nf12
+from _helpers import assert_bitwise
 from nf12 import reference
+from torch import nn
 
 from _device import DEV, cuda_only, requires_gpu
 from portable_random import generator, rand, randint, randn
@@ -20,13 +20,8 @@ pytestmark = requires_gpu
 
 
 
-def bits(t: torch.Tensor) -> torch.Tensor:
-    return t.contiguous().view(torch.int16)
 
 
-def assert_bitwise(a: torch.Tensor, b: torch.Tensor) -> None:
-    assert a.shape == b.shape and a.dtype == b.dtype
-    assert torch.equal(bits(a), bits(b))
 
 
 def weight(n: int, k: int, seed: int = 0, scale: float = 0.02) -> torch.Tensor:
@@ -134,8 +129,13 @@ def test_pack_bf16t_matches_reference():
 
 
 
-@pytest.mark.parametrize("n,k", SHAPES)
-@pytest.mark.parametrize("m", MS)
+@pytest.mark.parametrize("m,n,k", [
+    (m, n, k) for n, k in SHAPES for m in MS
+] + [
+    pytest.param(m, 1024, 4096, id=f"route-boundary-m{m}") for m in (4, 15, 17, 128, 512)
+] + [
+    pytest.param(m, 4096, 4096, id=f"square-m{m}") for m in (16, 32, 64, 128, 256)
+])
 def test_linear_matches_reference_and_bf16t(m, n, k):
     w = weight(n, k)
     nw = nf12.encode(w)
@@ -164,39 +164,42 @@ def test_linear_bias_and_escapes(m):
     assert_close_to_reference(y, x, w, bias)
 
 
-def test_linear_leading_dims_and_empty():
+def test_linear_leading_dims_and_empty(dense_ops):
+    encode, linear = dense_ops
     n, k = 256, 512
     w = weight(n, k)
-    nw = nf12.encode(w)
+    nw = encode(w)
     x = activations(2, 3, 5, k)
-    y = nf12.linear(x, nw)
+    y = linear(x, nw)
     assert y.shape == (2, 3, 5, n)
-    assert_bitwise(y, nf12.linear(x.reshape(-1, k), nw).reshape(2, 3, 5, n))
+    assert_bitwise(y, linear(x.reshape(-1, k), nw).reshape(2, 3, 5, n))
     x1 = activations(k)
-    assert nf12.linear(x1, nw).shape == (n,)
-    assert_bitwise(nf12.linear(x1, nw), nf12.linear(x1[None], nw)[0])
+    assert linear(x1, nw).shape == (n,)
+    assert_bitwise(linear(x1, nw), linear(x1[None], nw)[0])
     empty = torch.empty(0, 4, k, dtype=torch.bfloat16, device=DEV)
-    assert nf12.linear(empty, nw).shape == (0, 4, n)
+    assert linear(empty, nw).shape == (0, 4, n)
 
 
-def test_linear_non_contiguous_inputs():
+@pytest.mark.parametrize("m", [2, 16, 24, 64])
+def test_linear_non_contiguous_inputs(dense_ops, m):
+    encode, linear = dense_ops
     n, k = 256, 512
     w = weight(n, k)
-    nw = nf12.encode(w)
-    base = activations(24, 2 * k + 8)
+    nw = encode(w)
+    base = activations(m, 2 * k + 8)
     views = {
         "row_stride": base[:, :k],  # aligned rows, ld = 2k + 8
         "misaligned": base[:, 1 : k + 1],  # base not 16-byte aligned
-        "odd_ld": activations(24, k + 3)[:, :k],  # ld % 8 != 0
-        "transposed": activations(k, 24).t(),
+        "odd_ld": activations(m, k + 3)[:, :k],  # ld % 8 != 0
+        "transposed": activations(k, m).t(),
         "step": base[::2, :k],
-        "batched_strided": base[:, :k].reshape(4, 6, k).transpose(0, 1),
+        "batched_strided": base[:, :k].reshape(2, m // 2, k).transpose(0, 1),
     }
     for x in views.values():
-        assert_bitwise(nf12.linear(x, nw), nf12.linear(x.contiguous(), nw))
+        assert_bitwise(linear(x, nw), linear(x.contiguous(), nw))
     bias = activations(2 * n)[::2]
     x = base[:, :k]
-    assert_bitwise(nf12.linear(x, nw, bias), nf12.linear(x, nw, bias.contiguous()))
+    assert_bitwise(linear(x, nw, bias), linear(x, nw, bias.contiguous()))
 
 
 
@@ -372,16 +375,17 @@ def test_torch_compile_fullgraph(dynamic):
             assert_bitwise(torch.compile(block.up, fullgraph=True, dynamic=dynamic)(x), block.up(x))
 
 
-def test_torch_compile_functional():
+@pytest.mark.parametrize("static_weights", [False, True])
+def test_torch_compile_functional(static_weights):
     torch._dynamo.reset()
     nw = nf12.encode(weight(128, 256))
 
     @torch.compile(fullgraph=True)
     def f(x):
-        return nf12.linear(x, nw) * 2
+        return nf12.linear(x, nw, static_weights=static_weights) * 2
 
     x = activations(4, 256)
-    assert_bitwise(f(x), nf12.linear(x, nw) * 2)
+    assert_bitwise(f(x), nf12.linear(x, nw, static_weights=static_weights) * 2)
 
 
 def test_mps_library_requires_its_torch_version(tmp_path):
@@ -397,3 +401,19 @@ def test_mps_library_requires_its_torch_version(tmp_path):
     (tmp_path / "libnf12_mps.torch_version").write_text("2.10.0\n" if torch.__version__ != "2.10.0" else "2.11.0\n")
     assert not built_for_this_torch(lib)
     assert built_for_this_torch(tmp_path / "libnf12_torch.so")  # CUDA: torch stable ABI, any torch >= 2.10
+
+@pytest.mark.parametrize("magnitude,bias_value", [(2.**25, 1.), (1., 2.**-25), (2.**127, 2.**127)])
+@cuda_only
+def test_split_k_bias_follows_complete_reduction(dense_ops, magnitude, bias_value):
+    m, n, k = 16, 16, 512
+    w = torch.zeros((n, k), device="cuda", dtype=torch.bfloat16)
+    w[:, 0], w[:, 64] = magnitude, -magnitude
+    x = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    bias = torch.full((n,), bias_value, device="cuda", dtype=torch.bfloat16)
+    # The two nonzero products cancel exactly. Bias must survive unchanged,
+    # including when adding it to an unreduced partial would overflow FP32.
+    expected = bias.expand(m, n).contiguous()
+    encode, linear = dense_ops
+    out = linear(x, encode(w), bias)
+    assert bool(out.isfinite().all())
+    assert_bitwise(out, expected)

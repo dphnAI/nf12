@@ -51,8 +51,8 @@ Tensor byte_buffer(const Tensor& like, size_t bytes) {
 // A single row does not constrain the row stride.
 Tensor vector_rows(const Tensor& t) {
   auto ok = [](const Tensor& v) {
-    return v.stride(1) == 1 && (v.size(0) <= 1 || (v.stride(0) % 8 == 0 && v.stride(0) >= v.size(1))) &&
-           aligned16(v.data_ptr());
+    const bool rows = v.size(0) <= 1 || (v.stride(0) % 8 == 0 && v.stride(0) >= v.size(1));
+    return v.stride(1) == 1 && rows && aligned16(v.data_ptr());
   };
   if (ok(t)) return t;
   Tensor c = torch::stable::contiguous(t);
@@ -207,14 +207,15 @@ Tensor decode(const Tensor& packed, const Tensor& escapes, int64_t exp_base) {
 }
 
 Tensor linear(const Tensor& x, const Tensor& packed, const Tensor& escapes, int64_t exp_base,
-              const std::optional<Tensor>& bias) {
+              const std::optional<Tensor>& bias, bool static_weights) {
   const int32_t device = packed.get_device_index();
   const torch::stable::accelerator::DeviceGuard guard(device);
   const nf12_weight_t w = weight_view(packed, escapes, exp_base, device);
   return run_linear(x, w.n, w.k, bias, device, "linear", &w,
                     [&](const void* xp, int64_t m, int64_t ldx, const void* bp, void* yp, int64_t ldy, void* ws,
                         size_t ws_bytes, cudaStream_t stream) {
-                      return nf12_linear(xp, m, ldx, &w, bp, yp, ldy, ws, ws_bytes, stream);
+                      const auto fn = static_weights ? nf12_linear_static_weights : nf12_linear;
+                      return fn(xp, m, ldx, &w, bp, yp, ldy, ws, ws_bytes, stream);
                     });
 }
 
@@ -544,6 +545,10 @@ Tensor fused_moe(const Tensor& x, const Tensor& packed13, const std::optional<Te
                  const Tensor& packed2, const std::optional<Tensor>& escapes2,
                  const std::optional<Tensor>& escape_offsets2, const std::optional<Tensor>& exp_base2,
                  const Tensor& topk_weights, const Tensor& topk_ids, bool zero_fill) {
+  // The argument remains in the op schema for existing callers. The combine
+  // always reads every top-k slot, including assignments dropped by moe_align,
+  // so its input must be initialized even when the caller passes false.
+  (void)zero_fill;
   const int32_t device = packed13.get_device_index();
   const torch::stable::accelerator::DeviceGuard guard(device);
   const auto w13 = fused_weight_view(packed13, escapes13, escape_offsets13, exp_base13, device);
@@ -595,9 +600,9 @@ Tensor fused_moe(const Tensor& x, const Tensor& packed13, const std::optional<Te
   h = moe_silu_mul(h);
   const Tensor row_scale = torch::stable::view(scales, {t * topk});
   const Tensor y = w2.bf16t
-                       ? moe_linear_bf16t(h, packed2, offsets, std::nullopt, 1, sorted, row_scale, zero_fill)
+                       ? moe_linear_bf16t(h, packed2, offsets, std::nullopt, 1, sorted, row_scale, true)
                        : moe_linear(h, packed2, *escapes2, *escape_offsets2, *exp_base2, offsets, std::nullopt, 1,
-                                    sorted, row_scale, zero_fill);
+                                    sorted, row_scale, true);
   return moe_combine(y, topk);
 }
 
@@ -662,7 +667,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> encode_moe(const Tensor& w_in) {
 STABLE_TORCH_LIBRARY(nf12, m) {
   m.def("encode(Tensor w) -> (Tensor packed, Tensor escapes, int exp_base)");
   m.def("decode(Tensor packed, Tensor escapes, int exp_base) -> Tensor");
-  m.def("linear(Tensor x, Tensor packed, Tensor escapes, int exp_base, Tensor? bias=None) -> Tensor");
+  m.def("linear(Tensor x, Tensor packed, Tensor escapes, int exp_base, Tensor? bias=None, "
+        "*, bool static_weights=False) -> Tensor");
   m.def("pack_bf16t(Tensor w) -> Tensor");
   m.def("linear_bf16t(Tensor x, Tensor w_bf16t, Tensor? bias=None) -> Tensor");
   m.def("embedding(Tensor ids, Tensor packed, Tensor escapes, int exp_base) -> Tensor");

@@ -7,8 +7,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nf12"
-version = "1.0.1"
-description = "Lossless 12-bit encoding of BF16 weights with fused CUDA and Metal (PyTorch MPS, MLX) decode-GEMM kernels"
+version = "1.1.0"
+description = "Lossless 12-bit encoding of BF16 weights with fused CUDA, HIP and Metal decode-GEMM kernels"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"

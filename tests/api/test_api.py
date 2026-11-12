@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 
 import pytest
 import torch
@@ -48,6 +49,9 @@ def lib():
         "nf12_linear_decode_gemm_rows": (c_int64, [c_int64, c_int64, c_int64, c_int]),
         "nf12_linear": (c_int, [c_void_p, c_int64, c_int64, ctypes.POINTER(Weight), c_void_p, c_void_p, c_int64,
                                 c_void_p, c_size_t, c_void_p]),
+        "nf12_linear_static_weights": (
+            c_int, [c_void_p, c_int64, c_int64, ctypes.POINTER(Weight), c_void_p, c_void_p, c_int64,
+                    c_void_p, c_size_t, c_void_p]),
         "nf12_pack_bf16t": (c_int, [c_void_p, c_int64, c_int64, c_int64, c_void_p, c_void_p]),
         "nf12_linear_bf16t": (c_int, [c_void_p, c_int64, c_int64, c_void_p, c_int64, c_int64, c_void_p, c_void_p,
                                       c_int64, c_void_p, c_size_t, c_void_p]),
@@ -112,8 +116,9 @@ def test_linear_workspace_bytes(lib):
     dev = torch.cuda.current_device()
     assert lib.nf12_linear_workspace_bytes(0, 4096, 4096, dev) == 0
     assert lib.nf12_linear_workspace_bytes(-1, 4096, 4096, dev) == 0
-    assert lib.nf12_linear_workspace_bytes(1, 4096, 4096, -1) == 0
-    assert lib.nf12_linear_workspace_bytes(1, 4096, 4096, torch.cuda.device_count()) == 0
+    for m in (1, 16, 272):
+        assert lib.nf12_linear_workspace_bytes(m, 4096, 4096, -1) == 0
+        assert lib.nf12_linear_workspace_bytes(m, 4096, 4096, torch.cuda.device_count()) == 0
     # Valid queries are pure functions of their arguments.
     for m, n, k in [(1, 4096, 4096), (16, 1024, 16384), (512, 4096, 4096)]:
         a = lib.nf12_linear_workspace_bytes(m, n, k, dev)
@@ -131,9 +136,18 @@ def test_linear_decode_gemm_rows(lib):
         rows = lib.nf12_linear_decode_gemm_rows(m, n, k, dev)
         assert rows == lib.nf12_linear_decode_gemm_rows(m, n, k, dev)
         assert rows == 0 or (rows % 16 == 0 and 16 <= rows <= n)
+    # The slice height also respects the 256 MiB external decode budget.
+    for n, k in [(4096, 4096), (14336, 4096), (65536, 4096), (65552, 4096)]:
+        rows = lib.nf12_linear_decode_gemm_rows(512, n, k, dev)
+        if rows == 0:
+            continue  # this device selects the fused route for the shape
+        assert rows % 16 == 0 and 16 <= rows <= n and rows * k * 2 <= 256 * 1024 * 1024
+        if n * k * 2 <= 256 * 1024 * 1024:
+            assert rows == n
 
 
-def test_round_trip_and_linear(lib):
+@pytest.mark.parametrize("static_weights", [False, True])
+def test_round_trip_and_linear(lib, static_weights):
     n, k, m = 128, 512, 5
     w = bf16(n, k)
     weight, keep = c_encode(lib, w)
@@ -148,9 +162,9 @@ def test_round_trip_and_linear(lib):
     y = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
     ws_bytes = lib.nf12_linear_workspace_bytes(m, n, k, torch.cuda.current_device())
     ws = torch.empty(max(ws_bytes, 1), dtype=torch.uint8, device="cuda")
-    assert lib.nf12_linear(ptr(x), m, k, ctypes.byref(weight), ptr(bias), ptr(y), n, ptr(ws), ws_bytes,
-                           stream()) == OK
-    assert torch.equal(y.view(torch.int16), nf12.linear(x, nw, bias).view(torch.int16))
+    linear = lib.nf12_linear_static_weights if static_weights else lib.nf12_linear
+    assert linear(ptr(x), m, k, ctypes.byref(weight), ptr(bias), ptr(y), n, ptr(ws), ws_bytes, stream()) == OK
+    assert torch.equal(y.view(torch.int16), nf12.linear(x, nw, bias, static_weights=static_weights).view(torch.int16))
 
     wt = torch.empty(lib.nf12_bf16t_bytes(n, k), dtype=torch.uint8, device="cuda")
     assert lib.nf12_pack_bf16t(ptr(w), n, k, k, ptr(wt), stream()) == OK
@@ -160,11 +174,12 @@ def test_round_trip_and_linear(lib):
     assert torch.equal(y.view(torch.int16), y2.view(torch.int16))
 
     # m == 0 is a no-op that touches no pointer.
-    assert lib.nf12_linear(None, 0, k, ctypes.byref(weight), None, None, n, None, 0, stream()) == OK
+    assert linear(None, 0, k, ctypes.byref(weight), None, None, n, None, 0, stream()) == OK
     assert lib.nf12_last_cuda_error() == 0
 
 
-def test_linear_invalid_arguments(lib):
+@pytest.mark.parametrize("static_weights", [False, True])
+def test_linear_invalid_arguments(lib, static_weights):
     n, k, m = 64, 256, 4
     weight, keep = c_encode(lib, bf16(n, k))
     x = bf16(m, k + 8, seed=1)
@@ -172,10 +187,10 @@ def test_linear_invalid_arguments(lib):
     bias = bf16(n + 8)
     big = 1 << 26
     ws = torch.empty(big, dtype=torch.uint8, device="cuda")
+    linear = lib.nf12_linear_static_weights if static_weights else lib.nf12_linear
 
     def run(xp=ptr(x), mm=m, ldx=k + 8, w=weight, bp=ptr(bias), yp=ptr(y), ldy=n + 8, wsp=ptr(ws), wsb=big):
-        return lib.nf12_linear(xp, mm, ldx, ctypes.byref(w) if w is not None else None, bp, yp, ldy, wsp, wsb,
-                               stream())
+        return linear(xp, mm, ldx, ctypes.byref(w) if w is not None else None, bp, yp, ldy, wsp, wsb, stream())
 
     assert run() == OK
     assert run(bp=None) == OK
@@ -185,6 +200,7 @@ def test_linear_invalid_arguments(lib):
     assert run(ldx=k - 8) == INVALID
     assert run(ldx=k + 4) == INVALID  # ld % 8 != 0
     assert run(ldy=n - 8) == INVALID
+    assert run(mm=0) == OK  # an empty row block is a no-op, as on CUDA
     assert run(mm=-1) == INVALID
     assert run(bp=ptr(bias, 2)) == INVALID
     assert run(w=None) == INVALID
@@ -228,6 +244,8 @@ def test_insufficient_workspace(lib):
     assert status == INSUFFICIENT
     status = lib.nf12_linear(ptr(x), m, k, ctypes.byref(weight), None, ptr(y), n, None, 0, stream())
     assert status == INSUFFICIENT
+    # A nonzero byte count with no pointer is a malformed call, not a short one.
+    assert lib.nf12_linear(ptr(x), m, k, ctypes.byref(weight), None, ptr(y), n, None, need, stream()) == INVALID
     assert lib.nf12_linear(ptr(x), m, k, ctypes.byref(weight), None, ptr(y), n, ptr(ws), need, stream()) == OK
 
 
@@ -287,3 +305,19 @@ def test_codec_invalid_arguments(lib):
     assert lib.nf12_pack_bf16t(ptr(w, 2), n, k, k + 8, ptr(wt), stream()) == INVALID
     assert lib.nf12_pack_bf16t(ptr(w), n, 100, k + 8, ptr(wt), stream()) == INVALID
     torch.cuda.synchronize()
+
+
+def test_library_path_is_stable_across_threads():
+    """The JIT cache and loader locks are free-threaded safe."""
+    paths: list = [None] * 8
+
+    def run(i: int) -> None:
+        paths[i] = nf12.library_path()
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(paths))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(path == paths[0] for path in paths)
+    assert paths[0] == nf12.library_path()

@@ -329,7 +329,7 @@ int64_t decode_gemm_rows(int64_t m, int64_t n, int64_t k) {
 }
 
 Tensor linear(const Tensor& x, const Tensor& packed, const Tensor& escapes, int64_t exp_base,
-              const std::optional<Tensor>& bias) {
+              const std::optional<Tensor>& bias, bool /* static_weights */) {
   const WeightView w = weight_view(packed, escapes, exp_base);
   return run_linear(x, w.packed, w.n, w.k, bias, "linear", &w);
 }
@@ -593,7 +593,7 @@ Tensor fused_moe(const Tensor& x, const Tensor& packed13, const std::optional<Te
 TORCH_LIBRARY(nf12, m) {
   m.def("encode(Tensor w) -> (Tensor packed, Tensor escapes, int exp_base)");
   m.def("decode(Tensor packed, Tensor escapes, int exp_base) -> Tensor");
-  m.def("linear(Tensor x, Tensor packed, Tensor escapes, int exp_base, Tensor? bias=None) -> Tensor");
+  m.def("linear(Tensor x, Tensor packed, Tensor escapes, int exp_base, Tensor? bias=None, *, bool static_weights=False) -> Tensor");
   m.def("pack_bf16t(Tensor w) -> Tensor");
   m.def("linear_bf16t(Tensor x, Tensor w_bf16t, Tensor? bias=None) -> Tensor");
   m.def("embedding(Tensor ids, Tensor packed, Tensor escapes, int exp_base) -> Tensor");

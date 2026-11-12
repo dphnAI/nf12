@@ -23,16 +23,16 @@ _loaded = False
 METAL = sys.platform == "darwin"
 TORCH_LIBRARY = "libnf12_mps.dylib" if METAL else "libnf12_torch.so"
 # Files that must sit next to each torch library.
-_COMPANIONS = {"libnf12_torch.so": ("libnf12.so",),
+_COMPANIONS = {"libnf12_torch.so": ("libnf12_hip.so" if torch.version.hip is not None else "libnf12.so",),
                "libnf12_mps.dylib": ("nf12.metallib", "libnf12_mps.torch_version")}
-_NATIVE = {"libnf12.so", "libnf12_torch.so", "libnf12_mps.dylib", "nf12.metallib"}
+_NATIVE = {"libnf12.so", "libnf12_hip.so", "libnf12_torch.so", "libnf12_mps.dylib", "nf12.metallib"}
 
 
 def built_for_this_torch(library: Path) -> bool:
     """Whether a packaged ``libnf12_mps.dylib`` was built against the running torch.
 
     It uses PyTorch's MPS internals, which have no stable ABI, so CMake records
-    the build's torch version next to it. ``libnf12_torch.so`` (CUDA) uses the
+    the build's torch version next to it. ``libnf12_torch.so`` (CUDA/HIP) uses the
     torch stable ABI and loads under any torch >= 2.10, so it is not checked.
     """
     if library.name != "libnf12_mps.dylib":
@@ -44,10 +44,16 @@ def built_for_this_torch(library: Path) -> bool:
     return built == torch.__version__
 
 
-def library_path(name: str = "libnf12.so") -> Path:
+def _native_library_name() -> str:
+    """The C library for this backend."""
+    return "libnf12_hip.so" if torch.version.hip is not None else "libnf12.so"
+
+
+def library_path(name: str | None = None) -> Path:
     """Find a packaged native library, or build and cache it for visible GPUs."""
-    if METAL and name in ("libnf12.so", "libnf12_torch.so"):
-        raise ImportError(f"nf12: {name} (the C API and CUDA torch ops) is CUDA only; macOS builds the Metal backend")
+    name = _native_library_name() if name is None else name
+    if METAL and name in ("libnf12.so", "libnf12_hip.so", "libnf12_torch.so"):
+        raise ImportError(f"nf12: {name} (the C API and CUDA/HIP torch ops) is CUDA/HIP only; macOS builds the Metal backend")
     # Editable installs put the native install tree before the Python source tree.
     for directory in nf12.__path__:
         candidate = Path(directory) / name
@@ -67,6 +73,14 @@ def library_path(name: str = "libnf12.so") -> Path:
 def load() -> None:
     """Idempotently loads the torch extension (``torch.ops.nf12``) on first use."""
     global _loaded
+    # The fast path must stay outside the lock. Dynamo cannot enter a `lock`
+    # context manager, and `torch.compile(fullgraph=True)` turns that into an
+    # error, so a compiled frame has to trace straight through the `_loaded`
+    # check. This is double-checked locking: under a free-threaded (GIL=0)
+    # build two threads can pass the outer check together, but only the first
+    # one to take the lock registers the extension; the second sees `_loaded`
+    # inside the lock and returns. Registering twice is the unsafe outcome,
+    # not entering the lock twice.
     if _loaded:
         return
     with _lock:
@@ -117,7 +131,7 @@ def _register_fakes() -> None:
         return packed.new_empty((n, row_bytes * 2 // 3), dtype=torch.bfloat16)
 
     @_fake("linear")
-    def _linear(x, packed, escapes, exp_base, bias=None):
+    def _linear(x, packed, escapes, exp_base, bias=None, *, static_weights=False):
         return x.new_empty((*x.shape[:-1], packed.shape[0]))
 
     @_fake("pack_bf16t")

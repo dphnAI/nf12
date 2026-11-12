@@ -17,10 +17,13 @@ import threading
 from pathlib import Path
 
 _METAL = sys.platform == "darwin"
-_LIBRARIES = (("libnf12_mps.dylib", "nf12.metallib", "libnf12_mps.torch_version") if _METAL
-              else ("libnf12.so", "libnf12_torch.so"))
+_LIBRARIES_MPS = ("libnf12_mps.dylib", "nf12.metallib", "libnf12_mps.torch_version")
 # The MLX extension is a CPython module built against one MLX version.
 _MLX_LIBRARIES = ("_mlx_ext" + (sysconfig.get_config_var("EXT_SUFFIX") or ".so"), "nf12.metallib")
+# CUDA and HIP share the torch op layer, but use different kernel libraries.
+_LIBRARIES_CUDA = ("libnf12.so", "libnf12_torch.so")
+# Validated: ROCm SDK 10.1.0 / HIP 7.16.26385 on gfx1201; see tests/hip/README.md.
+_LIBRARIES_HIP = ("libnf12_hip.so", "libnf12_torch.so")
 _BUILD_ENV = (
     "CUDACXX", "CUDA_HOME", "CUDA_PATH", "CUDAHOSTCXX", "CXX", "CXXFLAGS",
     "CUDAFLAGS", "LDFLAGS", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS",
@@ -30,6 +33,51 @@ _BUILD_ENV = (
 _lock = threading.Lock()
 _directory: Path | None = None
 _mlx_directory: Path | None = None
+
+
+def _is_hip() -> bool:
+    """True on an ROCm build."""
+    import torch
+
+    return torch.version.hip is not None
+
+
+def _libraries() -> tuple[str, ...]:
+    if _METAL:
+        return _LIBRARIES_MPS
+    return _LIBRARIES_HIP if _is_hip() else _LIBRARIES_CUDA
+
+
+def _hip_compiler() -> str | None:
+    """CMake needs amdclang++ directly; it rejects the hipcc wrapper."""
+    explicit = os.environ.get("CMAKE_HIP_COMPILER")
+    if explicit:
+        return explicit
+    found = shutil.which("amdclang++")
+    if found:
+        return found
+    for root in (os.environ.get("ROCM_PATH"), os.environ.get("HIP_PATH"), "/opt/rocm"):
+        if not root:
+            continue
+        candidate = Path(root) / "bin" / "amdclang++"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _hip_architectures() -> list[str]:
+    """Visible gfx targets, e.g. ``gfx1201`` (feature suffixes stripped)."""
+    import torch
+
+    archs = sorted(
+        {
+            torch.cuda.get_device_properties(i).gcnArchName.split(":", 1)[0]
+            for i in range(torch.cuda.device_count())
+        }
+    )
+    if not archs:
+        raise RuntimeError("nf12: JIT compilation requires a visible ROCm GPU")
+    return archs
 
 
 def _source_root() -> Path:
@@ -68,6 +116,7 @@ def _torch_identity(archs: list[int | str]) -> dict:
     import torch
 
     return {
+        "backend": "mps" if _METAL else "hip" if _is_hip() else "cuda",
         "archs": archs,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -84,6 +133,17 @@ def _cache_key(source: Path, identity: dict) -> str:
         "environment": {name: os.environ.get(name) for name in _BUILD_ENV},
         "source_path": str(source.resolve()),
     }
+    if identity["backend"] == "hip":
+        import torch
+
+        # A different ROCm compiler emits different device code, so it must
+        # invalidate the cache exactly like CUDACXX does on the CUDA path.
+        # ``_hip_compiler`` resolves the same precedence the build uses
+        # (CMAKE_HIP_COMPILER, then PATH, then ROCM_PATH/HIP_PATH).
+        identity["hip_compiler"] = _hip_compiler()
+        identity["hip_toolkit"] = torch.version.hip
+        # CMake initializes HIP compiler flags from this environment variable.
+        identity["hip_flags"] = os.environ.get("HIPFLAGS")
     digest.update(json.dumps(identity, sort_keys=True).encode())
     digest.update(Path(__file__).read_bytes())
     files = [source / "CMakeLists.txt"]
@@ -95,7 +155,7 @@ def _cache_key(source: Path, identity: dict) -> str:
     return digest.hexdigest()
 
 
-def _ready(directory: Path, libraries: tuple[str, ...] = _LIBRARIES) -> bool:
+def _ready(directory: Path, libraries: tuple[str, ...]) -> bool:
     return (directory / "complete").is_file() and all(
         (directory / "build" / name).is_file() for name in libraries
     )
@@ -114,7 +174,7 @@ def _build_metal(source: Path, directory: Path, mlx: bool = False) -> None:
     env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", "4")
     # The torch library and the MLX module are built separately, so either
     # framework works without the other installed.
-    libraries = _MLX_LIBRARIES if mlx else _LIBRARIES
+    libraries = _MLX_LIBRARIES if mlx else _LIBRARIES_MPS
     commands = (
         [cmake, "-S", str(source), "-B", str(build), "-G", "Ninja",
          "-DCMAKE_BUILD_TYPE=Release", "-DNF12_BUILD_NATIVE=ON",
@@ -138,19 +198,45 @@ def _build(source: Path, directory: Path, archs: list[int | str]) -> None:
     if _METAL:
         _build_metal(source, directory)
         return
-    # Import CUDA toolkit discovery only on a cache miss.
-    from torch.utils.cpp_extension import CUDA_HOME
-
     cmake, ninja = shutil.which("cmake"), shutil.which("ninja")
-    nvcc = os.environ.get("CUDACXX")
-    if not nvcc:
-        nvcc = str(Path(CUDA_HOME) / "bin" / "nvcc") if CUDA_HOME else "nvcc"
-    nvcc = shutil.which(nvcc)
-    if not cmake or not ninja or not nvcc:
-        raise RuntimeError(
-            "nf12: JIT compilation requires CUDA toolkit 13.0+ (nvcc), CMake 3.26+, "
-            "Ninja, and a C++ compiler; set CUDA_HOME or CUDACXX to locate CUDA"
-        )
+    if not cmake or not ninja:
+        raise RuntimeError("nf12: JIT compilation requires CMake 3.26+ and Ninja on PATH")
+
+    if _is_hip():
+        compiler = _hip_compiler()
+        if not compiler:
+            raise RuntimeError(
+                "nf12: JIT compilation requires amdclang++ from the ROCm toolkit; "
+                "set CMAKE_HIP_COMPILER or ROCM_PATH to locate it"
+            )
+        configure = [
+            "-DNF12_BUILD_TORCH=ON",
+            "-DNF12_ENABLE_HIP=ON",
+            "-DNF12_HIP_ARCHS=" + ";".join(map(str, archs)),
+            f"-DCMAKE_HIP_COMPILER={compiler}",
+            f"-DPython_EXECUTABLE={sys.executable}",
+        ]
+        targets = ["nf12_hip", "nf12_torch"]
+    else:
+        # Import CUDA toolkit discovery only on a cache miss.
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        nvcc = os.environ.get("CUDACXX")
+        if not nvcc:
+            nvcc = str(Path(CUDA_HOME) / "bin" / "nvcc") if CUDA_HOME else "nvcc"
+        nvcc = shutil.which(nvcc)
+        if not nvcc:
+            raise RuntimeError(
+                "nf12: JIT compilation requires CUDA toolkit 13.0+ (nvcc); "
+                "set CUDA_HOME or CUDACXX to locate CUDA"
+            )
+        configure = [
+            "-DNF12_BUILD_TORCH=ON",
+            f"-DCMAKE_CUDA_COMPILER={nvcc}",
+            f"-DPython_EXECUTABLE={sys.executable}",
+            "-DNF12_CUDA_ARCHS=" + ";".join(map(str, archs)),
+        ]
+        targets = ["nf12", "nf12_torch"]
 
     build = directory / "build"
     log = directory / "build.log"
@@ -160,11 +246,9 @@ def _build(source: Path, directory: Path, archs: list[int | str]) -> None:
     env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", "4")
     commands = (
         [cmake, "-S", str(source), "-B", str(build), "-G", "Ninja",
-         "-DCMAKE_BUILD_TYPE=Release", "-DNF12_BUILD_NATIVE=ON", "-DNF12_BUILD_TORCH=ON",
-         f"-DCMAKE_MAKE_PROGRAM={ninja}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
-         f"-DPython_EXECUTABLE={sys.executable}",
-         "-DNF12_CUDA_ARCHS=" + ";".join(map(str, archs))],
-        [cmake, "--build", str(build), "--target", "nf12", "nf12_torch"],
+         "-DCMAKE_BUILD_TYPE=Release", "-DNF12_BUILD_NATIVE=ON",
+         f"-DCMAKE_MAKE_PROGRAM={ninja}", *configure],
+        [cmake, "--build", str(build), "--target", *targets],
     )
     logging.getLogger(__name__).info("Building NF12 for %s; log: %s", archs, log)
     try:
@@ -173,8 +257,10 @@ def _build(source: Path, directory: Path, archs: list[int | str]) -> None:
                 subprocess.run(command, env=env, stdout=output, stderr=subprocess.STDOUT, check=True)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"nf12: JIT compilation failed; see {log}") from error
-    if not all((build / name).is_file() for name in _LIBRARIES):
-        raise RuntimeError(f"nf12: JIT build did not produce both native libraries; see {log}")
+    if not all((build / name).is_file() for name in _libraries()):
+        raise RuntimeError(
+            f"nf12: JIT build did not produce {', '.join(_libraries())}; see {log}"
+        )
     (directory / "complete").touch()
 
 
@@ -197,8 +283,8 @@ def library_directory() -> Path:
     global _directory
     with _lock:
         if _directory is None:
-            archs = _architectures()
-            _directory = _cached_build(_torch_identity(archs), _LIBRARIES,
+            archs = _hip_architectures() if _is_hip() else _architectures()
+            _directory = _cached_build(_torch_identity(archs), _libraries(),
                                        lambda source, directory: _build(source, directory, archs))
         return _directory
 
