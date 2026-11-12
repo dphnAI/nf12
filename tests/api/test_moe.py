@@ -56,6 +56,45 @@ def close(a: torch.Tensor, b: torch.Tensor) -> None:
     torch.testing.assert_close(a.float(), b.float(), rtol=2e-2, atol=2e-2)
 
 
+def close_moe(out: torch.Tensor, ref: torch.Tensor, y: torch.Tensor) -> None:
+    """Secondary reference check; the BF16t contract is checked bitwise.
+
+    Keep the existing 2% coefficient, but account for cancellation between
+    routed terms when comparing different GEMM accumulation orders (§6.3).
+    """
+    assert out.shape == ref.shape
+    for value in (out, ref, y):
+        assert bool(torch.isfinite(value).all()), "non-finite MoE output or reference"
+    topk = y.shape[0] // ref.shape[0]
+    scale = y.float().reshape(ref.shape[0], topk, -1).abs().sum(dim=1)
+    tol = 2e-2 + 2e-2 * torch.maximum(ref.float().abs(), scale)
+    diff = (out.float() - ref.float()).abs()
+    bad = diff > tol
+    if bool(bad.any()):
+        row, col = torch.nonzero(bad)[0].tolist()
+        raise AssertionError(
+            f"{int(bad.sum())} elements exceed the cancellation-aware bound; "
+            f"diff {diff[row, col].item():.6g} > {tol[row, col].item():.6g} "
+            f"at ({row}, {col})"
+        )
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_close_moe_rejects_nonfinite(position, value):
+    tensors = [torch.zeros(1, 1) for _ in range(3)]
+    tensors[position][0, 0] = value
+    with pytest.raises(AssertionError, match="non-finite"):
+        close_moe(*tensors)
+
+
+def test_close_moe_rejects_excess_error():
+    ref = torch.zeros(1, 1)
+    terms = torch.tensor([[1.0], [-1.0]])
+    close_moe(torch.tensor([[0.04]]), ref, terms)
+    with pytest.raises(AssertionError, match="exceed"):
+        close_moe(torch.tensor([[0.1]]), ref, terms)
+
 
 
 @pytest.mark.parametrize("e,n,k", [(1, 16, 64), (5, 48, 128), (8, 256, 512)])
@@ -338,9 +377,20 @@ def test_fused_moe(t, e, k, inter, topk):
     m2, t2 = twin(w2)
     out = nf12.fused_moe(x, m13, m2, weights, ids)
     assert out.shape == (t, k)
-    close(out, reference.fused_moe(x, w13, w2, weights, ids))
-    assert_bitwise(out, nf12.fused_moe(x, t13, t2, weights, ids))
+    # SPEC §6.2 / §9.3: NF12 adds zero error to the matched BF16t kernel.
+    twin_out = nf12.fused_moe(x, t13, t2, weights, ids)
+    assert bool(torch.isfinite(out).all()) and bool(torch.isfinite(twin_out).all())
+    assert_bitwise(out, twin_out)
     assert_bitwise(out, nf12.fused_moe(x, m13, m2, weights, ids))
+    # Separately check the torch reference (§6.3), including cancellation.
+    sorted_ids, offsets = reference.moe_align(ids, e)
+    h = reference.moe_silu_mul(
+        reference.moe_linear(x, w13, offsets, gather=sorted_ids, gather_div=topk)
+    )
+    y = reference.moe_linear(
+        h, w2, offsets, scatter=sorted_ids, row_scale=weights.reshape(-1).float()
+    )
+    close_moe(out, reference.moe_combine(y, topk), y)
 
 
 @pytest.mark.parametrize("k,inter,n,topk", [(1024, 512, 1024, 1), (2048, 1024, 1024, 4),
