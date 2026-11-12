@@ -3,7 +3,9 @@
  *
  * Tensor and workspace pointers refer to device memory. Weight descriptors and
  * analysis outputs are host-resident. No function allocates device memory.
- * nf12_encode_analyze and nf12_encode synchronize the supplied stream.
+ * Analyze synchronizes for host metadata. Encode synchronizes to check escape
+ * capacity, then enqueues its final write on the supplied stream; wait on that
+ * stream before reading the encoded output.
  */
 #ifndef NF12_NF12_H_
 #define NF12_NF12_H_
@@ -11,7 +13,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef NF12_HIP
+/* ROCm build: the torch extension is backend-agnostic (it calls this API), so
+ * provide the CUDA spellings the shared C++ layer uses as HIP aliases. This is
+ * a type alias, not a second implementation. */
+#include <hip/hip_runtime_api.h>
+typedef hipStream_t cudaStream_t;
+typedef hipError_t cudaError_t;
+#define cudaSuccess hipSuccess
+#define cudaErrorNotSupported hipErrorNotSupported
+#define cudaGetErrorString hipGetErrorString
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaStreamSynchronize hipStreamSynchronize
+#else
 #include <cuda_runtime_api.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,7 +63,8 @@ size_t nf12_bf16t_bytes(int64_t n, int64_t k);
 
 /* Analyze selects exp_base and counts escapes before allocation.
  * exp_base_out and num_escapes_out are host pointers.
- * Analyze and encode synchronize stream and cannot be graph-captured.
+ * Both synchronize for host-side checks and cannot be graph-captured. Encode's
+ * final output write remains asynchronous on the supplied stream.
  * Both require nf12_encode_workspace_bytes(n, k) bytes of workspace. */
 size_t nf12_encode_workspace_bytes(int64_t n, int64_t k);
 nf12_status_t nf12_encode_analyze(const void* w_bf16, int64_t n, int64_t k, int64_t ldw, void* workspace,

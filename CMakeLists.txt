@@ -32,7 +32,7 @@ set(CMAKE_CUDA_ARCHITECTURES "${_nf12_archs}")
 
 option(NF12_BUILD_NATIVE "Build native libraries during installation" ON)
 if(NF12_BUILD_NATIVE)
-  project(nf12 VERSION 1.1.0 LANGUAGES CXX CUDA)
+  project(nf12 VERSION 1.1.0 LANGUAGES CXX)
 else()
   project(nf12 VERSION 1.1.0 LANGUAGES NONE)
 endif()
@@ -41,14 +41,85 @@ endif()
 install(FILES CMakeLists.txt DESTINATION nf12/_src)
 install(DIRECTORY csrc include DESTINATION nf12/_src
   FILES_MATCHING PATTERN "*.cu" PATTERN "*.cpp" PATTERN "*.cuh"
-  PATTERN "*.h" PATTERN "*.map")
+  PATTERN "*.h" PATTERN "*.map" PATTERN "*.hip"
+  # The HIP subtree has its own CMakeLists.txt. Without this the wheel ships
+  # csrc/hip/*.hip but no build file, so the ROCm JIT cannot configure it.
+  PATTERN "CMakeLists.txt")
 if(NOT NF12_BUILD_NATIVE)
   return()
+endif()
+
+# Shared by both backends: the torch extension is the same op layer on CUDA
+# (linking libnf12.so) and ROCm (linking libnf12_hip.so). Probe the installed
+# wheel before choosing backend defaults: a ROCm host may also have nvcc.
+option(NF12_BUILD_TORCH "Build the torch extension (libnf12_torch.so)" ON)
+if(NF12_BUILD_TORCH)
+  find_package(Python COMPONENTS Interpreter REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+      "import torch; print('hip' if torch.version.hip is not None else ('cuda' if torch.version.cuda is not None else 'cpu'))"
+    OUTPUT_VARIABLE NF12_TORCH_BACKEND
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  message(STATUS "nf12: torch backend is ${NF12_TORCH_BACKEND}")
+else()
+  set(NF12_TORCH_BACKEND "none")
+endif()
+
+set(_nf12_hip_default OFF)
+if(NF12_TORCH_BACKEND STREQUAL "hip")
+  set(_nf12_hip_default ON)
+endif()
+option(NF12_ENABLE_HIP "Build the RDNA4 HIP kernels (libnf12_hip.so)" ${_nf12_hip_default})
+if(NF12_TORCH_BACKEND STREQUAL "hip" AND NOT NF12_ENABLE_HIP)
+  message(FATAL_ERROR "nf12: the installed torch wheel uses ROCm; enable NF12_ENABLE_HIP")
+endif()
+if(NF12_BUILD_TORCH AND NF12_ENABLE_HIP AND NOT NF12_TORCH_BACKEND STREQUAL "hip")
+  message(FATAL_ERROR
+    "nf12: the HIP torch extension requires ROCm PyTorch in the build environment. "
+    "Build under ROCm PyTorch with --no-build-isolation, or set "
+    "NF12_BUILD_TORCH=OFF to build the HIP C library without torch.")
+endif()
+
+# CUDA is optional, and a ROCm torch wheel does not need nvcc even if it is
+# installed. NF12_CUDA_ARCHS is parsed above before CUDA is enabled.
+include(CheckLanguage)
+if(NF12_TORCH_BACKEND STREQUAL "hip")
+  set(NF12_HAVE_CUDA OFF)
+else()
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(NF12_HAVE_CUDA ON)
+  else()
+    set(NF12_HAVE_CUDA OFF)
+    message(STATUS "nf12: no CUDA compiler found; skipping the CUDA targets")
+  endif()
+endif()
+
+if(NOT NF12_HAVE_CUDA AND NOT NF12_ENABLE_HIP)
+  message(FATAL_ERROR
+    "nf12: neither a CUDA compiler nor NF12_ENABLE_HIP is available. Install the "
+    "CUDA toolkit, or configure with -DNF12_ENABLE_HIP=ON on an ROCm host.")
+endif()
+
+# The CUDA kernels are built unless torch is the ROCm wheel. The CUDA torch
+# extension is further restricted to a CUDA wheel: a CPU wheel has no
+# torch_cuda, and a ROCm wheel must not enter the CUDA subtree at all.
+set(NF12_BUILD_CUDA_TARGETS OFF)
+if(NF12_HAVE_CUDA AND NOT NF12_TORCH_BACKEND STREQUAL "hip")
+  set(NF12_BUILD_CUDA_TARGETS ON)
+endif()
+set(NF12_BUILD_CUDA_TORCH OFF)
+if(NF12_BUILD_TORCH AND NF12_TORCH_BACKEND STREQUAL "cuda")
+  set(NF12_BUILD_CUDA_TORCH ON)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+if(NF12_BUILD_CUDA_TARGETS)
 
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "nf12: CUDA ${CUDAToolkit_VERSION}, archs ${CMAKE_CUDA_ARCHITECTURES}")
@@ -67,8 +138,6 @@ set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
-option(NF12_BUILD_TORCH "Build the torch extension (libnf12_torch.so)" ON)
-
 # --use_fast_math would violate the numerical contract in SPEC.md section 6.
 # NVCC's warning policy does not cover the host compiler or PTX assembler.
 set(NF12_CUDA_FLAGS -O3 -lineinfo --expt-relaxed-constexpr -Xfatbin=-compress-all
@@ -80,7 +149,9 @@ file(GLOB_RECURSE NF12_KERNEL_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/*.cu")
 
 add_library(nf12 SHARED
-  csrc/api.cu
+  csrc/api.cpp
+  csrc/backend_cuda.cu
+  csrc/status.cpp
   csrc/device_info.cu
   ${NF12_KERNEL_SOURCES})
 target_include_directories(nf12
@@ -100,7 +171,7 @@ set_target_properties(nf12 PROPERTIES
 install(TARGETS nf12 LIBRARY DESTINATION nf12)
 
 # torch.ops.load_library uses the stable ABI without a Python ABI dependency.
-if(NF12_BUILD_TORCH)
+if(NF12_BUILD_CUDA_TORCH)
   find_package(Python COMPONENTS Interpreter REQUIRED)
   execute_process(
     COMMAND "${Python_EXECUTABLE}" -c "import os, torch; print(os.path.dirname(torch.__file__))"
@@ -130,4 +201,26 @@ if(NF12_BUILD_TORCH)
     BUILD_RPATH "$ORIGIN;${NF12_TORCH_DIR}/lib"
     INSTALL_RPATH "$ORIGIN")
   install(TARGETS nf12_torch LIBRARY DESTINATION nf12)
+endif()
+
+endif()  # NF12_HAVE_CUDA
+
+# RDNA4 (gfx1200/gfx1201) HIP kernels. The subtree also builds standalone
+# without a CUDA toolkit via `cmake -S csrc/hip -B build-hip`.
+if(NF12_ENABLE_HIP)
+  # CMake looks for hipconfig on PATH when finding HIP. Some ROCm installations
+  # expose neither hipconfig nor amdclang++ there, including package builds,
+  # so locate the compiler directly as the runtime JIT does.
+  if(NOT CMAKE_HIP_COMPILER AND NOT "$ENV{CMAKE_HIP_COMPILER}" STREQUAL "")
+    set(CMAKE_HIP_COMPILER "$ENV{CMAKE_HIP_COMPILER}" CACHE FILEPATH "HIP compiler")
+  endif()
+  if(NOT CMAKE_HIP_COMPILER AND "$ENV{HIPCXX}" STREQUAL "")
+    find_program(_nf12_hip_compiler NAMES amdclang++
+      HINTS "$ENV{ROCM_PATH}/bin" "$ENV{HIP_PATH}/bin" /opt/rocm/bin)
+    if(_nf12_hip_compiler)
+      set(CMAKE_HIP_COMPILER "${_nf12_hip_compiler}" CACHE FILEPATH "HIP compiler")
+    endif()
+  endif()
+  enable_language(HIP)
+  add_subdirectory(csrc/hip)
 endif()

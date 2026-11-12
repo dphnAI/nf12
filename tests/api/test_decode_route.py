@@ -20,10 +20,10 @@ from __future__ import annotations
 import ctypes
 import os
 
+import nf12
 import pytest
 import torch
-
-import nf12
+from _helpers import bits
 from nf12 import reference
 from test_api import OK, Weight, lib, ptr, stream  # noqa: F401  (lib is a fixture)
 from test_moe import MoeWeight, experts, routing
@@ -37,8 +37,6 @@ M_PROBE = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 SHAPES = [(1024, 2048), (16 * 1031, 8192), (128, 2048)]
 
 
-def bits(t: torch.Tensor) -> torch.Tensor:
-    return t.contiguous().view(torch.int16)
 
 
 def rand(*shape: int, seed: int, scale: float = 1.0) -> torch.Tensor:
@@ -235,7 +233,8 @@ def test_moe_decode_slices_and_gating(moe_lib):
         for i in range(e):
             want = w[i] if active[i] else torch.full_like(w[i], -3.0)
             assert torch.equal(bits(out[i]), bits(want)), i
-    bad = [(-16, 16), (8, 16), (0, 8), (32, 32)]  # row0 < 0, unaligned row0/rows, past N
+    # Past-N and stride cases run against the shared ABI in test_shared_abi.py.
+    bad = [(-16, 16), (8, 16)]  # row0 < 0, unaligned rows
     for row0, rows in bad:
         assert moe_lib.nf12_moe_decode(ctypes.byref(cw), None, 0, row0, rows, out.data_ptr(), k, stream()) != OK
 
@@ -252,11 +251,7 @@ def test_moe_grouped_operands(moe_lib):
     assert ends.tolist() == BAD_ENDS
     valid = BAD_ENDS[-1]
     assert torch.equal(bits(xg[:valid]), bits(x[gather[:valid].long() // div]))
-    # Without gather only the ends are written.
-    ends.fill_(-1)
-    assert moe_lib.nf12_moe_grouped_operands(None, k, None, 1, off.data_ptr(), a, e, k, None, k, ends.data_ptr(),
-                                             stream()) == OK
-    assert ends.tolist() == BAD_ENDS
+    # The no-gather copy contract is in test_shared_abi.py; only div validation here.
     assert moe_lib.nf12_moe_grouped_operands(None, k, None, 0, off.data_ptr(), a, e, k, None, k, ends.data_ptr(),
                                              stream()) != OK
     # Rows past the valid count are left alone.
