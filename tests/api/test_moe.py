@@ -987,6 +987,45 @@ def test_fused_moe_dropped_assignment_ignores_router_scale(moe_pack, ids, bad_sc
     torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.parametrize("bad_scale", [float("nan"), float("inf")], ids=["nan", "inf"])
+@pytest.mark.parametrize("tokens", [1, 2, 40])
+def test_fused_moe_dropped_slot_scale_is_never_applied(moe_pack, bad_scale, tokens):
+    """Without an expert_map, a -1 slot adds zero and its router weight never
+    reaches the output: NaN/Inf and 1.0 give identical bits (same assignment
+    count, same kernels), the result is close to the single-slot call (fewer
+    assignments, so other kernels), and all-dropped tokens are exactly zero."""
+    e, k, inter = 4, 256, 128
+    w13 = experts(e, 2 * inter, k, seed=80, scale=.02, spread=0)
+    w2 = experts(e, k, inter, seed=81, scale=.02, spread=0)
+    a, b = moe_pack(w13), moe_pack(w2)
+    x = activations(tokens, k, seed=82) * .05
+    weights, ids = routing(tokens, e, 1, seed=83)
+    ids = torch.cat([ids, torch.full_like(ids, -1)], 1)
+    out = nf12.fused_moe(x, a, b, torch.cat([weights, torch.full_like(weights, bad_scale)], 1), ids)
+    assert bool(out.isfinite().all())
+    assert_bitwise(out, nf12.fused_moe(x, a, b, torch.cat([weights, torch.ones_like(weights)], 1), ids))
+    close(out, nf12.fused_moe(x, a, b, weights, ids[:, :1]))
+    all_dropped = torch.full_like(ids, -1)
+    out = nf12.fused_moe(x, a, b, torch.full((tokens, 2), bad_scale, device=DEV), all_dropped)
+    assert_bitwise(out, torch.zeros_like(out))
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 64])
+def test_fused_moe_identity_expert_map_changes_nothing(moe_pack, tokens):
+    """The reported symptom: an identity map returned zeros on one GPU. Every
+    row is written here, so this only fails where a dispatch silently does not
+    run (the threadgroup limit launch.h now checks), not on the zero-fill change."""
+    e, k, inter, topk = 4, 256, 128, 2
+    w13 = experts(e, 2 * inter, k, seed=76, scale=.02)
+    w2 = experts(e, k, inter, seed=77, scale=.02)
+    a, b = moe_pack(w13), moe_pack(w2)
+    x = activations(tokens, k, seed=78)
+    weights, ids = routing(tokens, e, topk, seed=79)
+    out = nf12.fused_moe(x, a, b, weights, ids, expert_map=torch.arange(e, dtype=torch.int32, device=DEV))
+    assert bool(out.abs().amax() > 0)
+    assert_bitwise(out, nf12.fused_moe(x, a, b, weights, ids))
+
+
 @pytest.mark.parametrize("operation", ["dense", "routed", "fused"])
 @cuda_only
 def test_inference_streams_own_their_scratch(moe_pack, operation):

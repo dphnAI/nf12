@@ -217,7 +217,8 @@ CUDA aarch64 machine (for example an RTX 5090 host and a DGX Spark).
 What the suites check:
 
 - **Kernels against references:** codec bytes equal `nf12.reference`, NF12 output
-  equals the bf16t twin bit for bit, and MLX output equals MPS output bit for bit.
+  equals the bf16t twin bit for bit, and MLX output equals MPS output bit for bit
+  on nf12's own kernels.
 - **Module state** (`tests/api/test_modules.py`, `tests/mlx/test_mlx_modules.py`):
   NF12 modules inside parent models get their weights replaced through every loading
   path users take (a parent's or a child's update or load, files, partial and rejected
@@ -225,11 +226,21 @@ What the suites check:
   and its decode, a compiled forward captured beforehand, and a save/reload. Testing
   module methods directly missed paths that never call them.
 - **Cross-framework checkpoints:** a checkpoint saved by either framework's modules
-  loads into the other's with bit-identical outputs.
+  loads into the other's with bit-identical decoded weights, and bit-identical outputs
+  on nf12's own kernels.
 
 Test data comes from `tests/portable_random.py`, so it is bit-identical on every
 machine and device. A new test should fail on the code it guards; check that by
 running it against the unfixed code.
+
+Bit-exact assertions are only made where nf12's code fixes the arithmetic order:
+nf12's own kernels (routes depend on shapes and environment variables, never on
+the GPU, and the shaders build with `-fno-fast-math`), or the same framework call
+at the same shape on the same inputs. The decode route's GEMM belongs to the
+framework (MPS or MLX), which chooses its kernel by GPU and shape, so it is
+compared with a tolerance against anything else. A bit-exact pass on one Apple GPU
+does not carry over to another, so Metal changes should also be run on a second
+Apple GPU generation when one is available.
 
 ## Limitations and next steps
 

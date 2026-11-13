@@ -63,7 +63,13 @@ struct MlxEncoder {
   mx::metal::CommandEncoder& ce;
   MTL::Library* lib;
 
-  void pipeline(const std::string& name) { ce.set_compute_pipeline_state(d.get_kernel(name, lib)); }
+  ThreadgroupLimit limit{};
+
+  void pipeline(const std::string& name) {
+    MTL::ComputePipelineState* pso = d.get_kernel(name, lib);
+    ce.set_compute_pipeline_state(pso);
+    limit.set(name, pso->maxTotalThreadsPerThreadgroup());
+  }
   void in(const array& a, int index) { ce.set_input_array(a, index); }
   void out(array& a, int index) { ce.set_output_array(a, index); }
   template <typename T>
@@ -72,6 +78,7 @@ struct MlxEncoder {
   }
   void dispatch(uint64_t gx, uint64_t gy, uint64_t gz, uint64_t tx, uint64_t ty, uint64_t tz) {
     if (gx == 0 || gy == 0 || gz == 0) return;
+    limit.check(tx * ty * tz);
     ce.dispatch_threadgroups(MTL::Size(gx, gy, gz), MTL::Size(tx, ty, tz));
   }
   // MLX encodes concurrent dispatches; order writes to the same buffer.
@@ -619,7 +626,9 @@ MoeWeight fused_weight_view(const array& packed, const optional<array>& escapes,
 array fused_moe(const array& x, const array& packed13, const optional<array>& escapes13,
                 const optional<array>& escape_offsets13, const optional<array>& exp_base13, const array& packed2,
                 const optional<array>& escapes2, const optional<array>& escape_offsets2,
-                const optional<array>& exp_base2, const array& topk_weights, const array& topk_ids, bool zero_fill) {
+                const optional<array>& exp_base2, const array& topk_weights, const array& topk_ids) {
+  // y is always zeroed, as in torch.ops.nf12._fused_moe: dropped assignments
+  // (id -1, with or without an expert_map) are never written.
   const MoeWeight w13 = fused_weight_view(packed13, escapes13, escape_offsets13, exp_base13);
   const MoeWeight w2 = fused_weight_view(packed2, escapes2, escape_offsets2, exp_base2);
   if (w13.experts != w2.experts || w13.n != 2 * w2.k) fail("nf12.fused_moe: weights need the same E and N13 == 2 * K2");
@@ -637,7 +646,7 @@ array fused_moe(const array& x, const array& packed13, const optional<array>& es
   array h = run_moe_linear(x, w13, offsets, sorted, topk, std::nullopt, std::nullopt, false, "fused_moe");
   h = moe_silu_mul(h);
   const array row_scale = mx::reshape(topk_weights, {int(t * topk)}, s);
-  const array y = run_moe_linear(h, w2, offsets, std::nullopt, 1, sorted, row_scale, zero_fill, "fused_moe");
+  const array y = run_moe_linear(h, w2, offsets, std::nullopt, 1, sorted, row_scale, true, "fused_moe");
   return moe_combine(y, topk);
 }
 
@@ -669,5 +678,5 @@ NB_MODULE(_mlx_ext, m) {
   m.def("moe_silu_mul", &moe_silu_mul, "h"_a);
   m.def("fused_moe", &fused_moe, "x"_a, "packed13"_a, "escapes13"_a.none(), "escape_offsets13"_a.none(),
         "exp_base13"_a.none(), "packed2"_a, "escapes2"_a.none(), "escape_offsets2"_a.none(), "exp_base2"_a.none(),
-        "topk_weights"_a, "topk_ids"_a, "zero_fill"_a = false);
+        "topk_weights"_a, "topk_ids"_a);
 }

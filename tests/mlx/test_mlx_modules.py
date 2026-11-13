@@ -13,6 +13,7 @@ every shape before any child is involved."""
 from __future__ import annotations
 
 import itertools
+import os
 
 import pytest
 
@@ -266,8 +267,11 @@ def test_set_dtype_leaves_nf12_arrays():
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="PyTorch MPS required")
 @pytest.mark.parametrize("direction", ["torch->mlx", "mlx->torch"])
 def test_checkpoints_cross_frameworks(direction, tmp_path):
-    """A checkpoint saved by either framework's modules loads into the other's
-    and gives bit-identical outputs (both run the same kernels)."""
+    """A checkpoint saved by either framework's modules loads into the other's:
+    the decoded weights are bit-identical, and so are the outputs when both
+    frameworks run nf12's kernels. The decode route hands the GEMM to each
+    framework's own matmul (MPS vs MLX), whose accumulation order depends on
+    the GPU and shape, so there the outputs only agree to bf16 rounding."""
     safetensors_torch = pytest.importorskip("safetensors.torch")
     import nf12
     from torch import nn
@@ -298,9 +302,16 @@ def test_checkpoints_cross_frameworks(direction, tmp_path):
         torch_net.load_state_dict(safetensors_torch.load_file(path))
         net = Net(esc, BIAS)
     assert_holds(net, esc)
+    for name, mm in nf12_modules(net).items():
+        decoded = torch_net.get_submodule(name).weight.decode().cpu()
+        assert torch.equal(decoded.view(torch.int16), mlx_to_torch(mm.nf12_weight.decode()).view(torch.int16)), name
+    exact = os.environ.get("NF12_MPS_LINEAR") != "decode"
     got = torch_net(*(mlx_to_torch(a).to("mps") for a in INPUTS))
     for i, (t, m) in enumerate(zip(got, net(*INPUTS)[:3])):
-        assert torch.equal(t.cpu().view(torch.int16), mlx_to_torch(m).view(torch.int16)), f"output {i}"
+        if exact or i == 2:  # output 2 is the embedding: no GEMM
+            assert torch.equal(t.cpu().view(torch.int16), mlx_to_torch(m).view(torch.int16)), f"output {i}"
+        else:
+            torch.testing.assert_close(t.cpu().float(), mlx_to_torch(m).float(), rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("order", ["packed first", "escapes first"])
@@ -393,14 +404,21 @@ def test_bias_at_odd_offset():
 
 
 def test_decode_route_slices_match(monkeypatch):
-    """The large-M decode route decodes bounded row slices; results equal the
-    whole-weight decode (1 MiB slices force several)."""
+    """The large-M decode route decodes bounded row slices (1 MiB slices force
+    several) and runs MLX's GEMM on each. Each slice is compared with the same
+    GEMM on the same slice of the decoded weight: a different GEMM shape may
+    accumulate in a different order on another GPU, so the whole-weight
+    product is only close, not bit-identical."""
     monkeypatch.setenv("NF12_MPS_LINEAR", "decode")  # the route under test, whatever the matrix forces
+    monkeypatch.delenv("NF12_MPS_DECODE_SLICE_MB", raising=False)
     w = randn(2048, 1024, seed=8, scale=0.02)
     w[5, :8] = 1e30
     nw = nm.encode(to_mlx(w))
     x, b = to_mlx(randn(40, 1024, seed=9)), to_mlx(randn(2048, seed=10))
-    whole = nm.linear(x, nw, b)
+    wd = nw.decode()
+    assert bits_equal(nm.linear(x, nw, b), mx.addmm(b, x, wd.T))  # 16 MiB default: one slice
     monkeypatch.setenv("NF12_MPS_DECODE_SLICE_MB", "1")
-    assert bits_equal(nm.linear(x, nw, b), whole)
-    assert bits_equal(whole, mx.addmm(b, x, nw.decode().T))
+    rows = max(16, (1 << 20) // (1024 * 2) // 16 * 16)  # launch.h decode_slice_rows: 512 rows per 1 MiB slice
+    assert rows < 2048
+    want = mx.concatenate([mx.addmm(b[r:r + rows], x, wd[r:r + rows].T) for r in range(0, 2048, rows)], axis=1)
+    assert bits_equal(nm.linear(x, nw, b), want)

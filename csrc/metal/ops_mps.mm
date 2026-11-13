@@ -77,7 +77,12 @@ struct TorchEncoder {
   using tensor = Tensor;
   using out_t = const Tensor&;
   id<MTLComputeCommandEncoder> enc;
-  void pipeline(const std::string& name) { [enc setComputePipelineState:nf12_mps::pipeline(name.c_str())]; }
+  ThreadgroupLimit limit{};
+  void pipeline(const std::string& name) {
+    id<MTLComputePipelineState> pso = nf12_mps::pipeline(name.c_str());
+    [enc setComputePipelineState:pso];
+    limit.set(name, pso.maxTotalThreadsPerThreadgroup);
+  }
   void in(const Tensor& t, int index) {
     [enc setBuffer:mtl_buffer(t) offset:t.storage_offset() * t.element_size() atIndex:index];
   }
@@ -88,6 +93,7 @@ struct TorchEncoder {
   }
   void dispatch(uint64_t gx, uint64_t gy, uint64_t gz, uint64_t tx, uint64_t ty, uint64_t tz) {
     if (gx == 0 || gy == 0 || gz == 0) return;
+    limit.check(tx * ty * tz);
     [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
   }
   // PyTorch's MPS compute encoder dispatches serially.
@@ -560,7 +566,11 @@ Tensor fused_moe(const Tensor& x, const Tensor& packed13, const std::optional<Te
                  const std::optional<Tensor>& escape_offsets13, const std::optional<Tensor>& exp_base13,
                  const Tensor& packed2, const std::optional<Tensor>& escapes2,
                  const std::optional<Tensor>& escape_offsets2, const std::optional<Tensor>& exp_base2,
-                 const Tensor& topk_weights, const Tensor& topk_ids, bool zero_fill) {
+                 const Tensor& topk_weights, const Tensor& topk_ids, bool /* zero_fill */) {
+  // As on CUDA, zero_fill stays in the schema for existing callers but y is
+  // always zeroed: the combine reads every top-k slot, and an assignment
+  // dropped by moe_align (id -1, with or without an expert_map) is never
+  // written, so its router weight (even NaN/Inf) never reaches the output.
   const MoeWeight w13 = fused_weight_view(packed13, escapes13, escape_offsets13, exp_base13);
   const MoeWeight w2 = fused_weight_view(packed2, escapes2, escape_offsets2, exp_base2);
   TORCH_CHECK(w13.experts == w2.experts && w13.n == 2 * w2.k,
@@ -583,7 +593,7 @@ Tensor fused_moe(const Tensor& x, const Tensor& packed13, const std::optional<Te
   Tensor h = run_moe_linear(x, w13, offsets, sorted, topk, std::nullopt, std::nullopt, false, "_fused_moe");
   h = moe_silu_mul(h);
   const Tensor row_scale = topk_weights.contiguous().view({t * topk});
-  const Tensor y = run_moe_linear(h, w2, offsets, std::nullopt, 1, sorted, row_scale, zero_fill, "_fused_moe");
+  const Tensor y = run_moe_linear(h, w2, offsets, std::nullopt, 1, sorted, row_scale, true, "_fused_moe");
   return moe_combine(y, topk);
 }
 

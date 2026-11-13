@@ -21,6 +21,11 @@ constant constexpr uint kSuperAtomBytesBf16t = 2048;
 constant constexpr uint kPlaneBytes = 512;
 constant constexpr uint kMaxExpBase = 120;
 
+// Each kernel declares the largest threadgroup launch.h dispatches it with, so the
+// compiler budgets registers for it and every GPU's pipeline accepts that size
+// (launch.h also checks maxTotalThreadsPerThreadgroup before each dispatch).
+#define NF12_THREADS(n) [[max_total_threads_per_threadgroup(n)]]
+
 struct Group {
   uint meta, lo0, lo1;
 };

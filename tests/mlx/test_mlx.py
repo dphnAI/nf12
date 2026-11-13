@@ -331,6 +331,35 @@ def test_fused_moe_expert_map():
         assert_bitwise(y, expected.cpu())
 
 
+@pytest.mark.parametrize("pack", ["nf12", "bf16t"])
+@pytest.mark.parametrize("bad_scale", [float("nan"), float("inf")], ids=["nan", "inf"])
+@pytest.mark.parametrize("t", [1, 2, 40])
+def test_fused_moe_dropped_assignment_contributes_zero(moe_route, pack, bad_scale, t):
+    """An id of -1 drops its assignment with or without an expert_map: it adds
+    zero and its router weight (even NaN/Inf) is never applied. Bit-exact checks
+    compare calls with the same assignment count, so both run the same kernels."""
+    e, k, inter = 4, 256, 128
+    w13, w2 = moe_layer(e, k, inter, seed=72, escapes=False)
+    p = nm.encode_moe if pack == "nf12" else nm.pack_bf16t_moe
+    a, b = p(w13), p(w2)
+    x = activations(t, k, seed=74)
+    weights, ids = routing(t, e, 1, seed=75)
+    dropped_ids = mx.concatenate([ids, mx.full((t, 1), -1, dtype=mx.int32)], 1)
+
+    def scaled(s):
+        return mx.concatenate([weights, mx.full((t, 1), s, dtype=mx.float32)], 1)
+
+    out = nm.fused_moe(x, a, b, scaled(bad_scale), dropped_ids)
+    assert bool(mx.isfinite(out).all())
+    assert_bitwise(out, nm.fused_moe(x, a, b, scaled(1.0), dropped_ids))  # the scale is never applied
+    alone = nm.fused_moe(x, a, b, weights, ids)  # fewer assignments: other kernels, so only close
+    torch.testing.assert_close(to_torch(out).float(), to_torch(alone).float(), rtol=1e-2, atol=1e-2)
+    all_dropped = mx.full((t, 2), -1, dtype=mx.int32)
+    assert_bitwise(nm.fused_moe(x, a, b, scaled(bad_scale), all_dropped), mx.zeros((t, k), dtype=mx.bfloat16))
+    identity = mx.arange(e, dtype=mx.int32)
+    assert_bitwise(nm.fused_moe(x, a, b, scaled(bad_scale), dropped_ids, expert_map=identity), out)
+
+
 # --- modules, top-level routing, packaging -------------------------------------
 
 @pytest.mark.parametrize("bias", [False, True])

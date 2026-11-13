@@ -136,7 +136,7 @@ inline void linear_gemm(Src src, device const ushort* x, device const ushort* bi
 // Entry points. Buffers: 0 x, 1 weight (packed or bf16t), 2 escapes (NF12), 3 bias, 4 y, 5 params,
 // 6 exp_base (NF12, uchar[1]).
 #define NF12_SMALL_KERNEL(MT)                                                                                      \
-  kernel void nf12_linear_small_nf12_m##MT(                                                                        \
+  NF12_THREADS(32 * kSmallMaxSimdgroups) kernel void nf12_linear_small_nf12_m##MT(                                                                        \
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],                          \
       device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],                                      \
@@ -147,7 +147,7 @@ inline void linear_gemm(Src src, device const ushort* x, device const ushort* bi
     linear_small<MT>(NF12Source{packed, escapes, exp_base_x4(exp_base[0])}, x, bias, y, p, tg, sg, lane, tid,       \
                      threads.x, part);                                                                             \
   }                                                                                                                \
-  kernel void nf12_linear_small_bf16t_m##MT(                                                                       \
+  NF12_THREADS(32 * kSmallMaxSimdgroups) kernel void nf12_linear_small_bf16t_m##MT(                                                                       \
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const ushort* bias [[buffer(3)]], device ushort* y [[buffer(4)]],                                     \
       constant LinearParams& p [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]],                           \
@@ -162,7 +162,7 @@ NF12_SMALL_KERNEL(2)
 NF12_SMALL_KERNEL(4)
 NF12_SMALL_KERNEL(8)
 
-kernel void nf12_linear_gemm_nf12(device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],
+NF12_THREADS(32 * kGemmSimdgroups) kernel void nf12_linear_gemm_nf12(device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],
                                   device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],
                                   device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],
                                   device const uchar* exp_base [[buffer(6)]],
@@ -175,7 +175,7 @@ kernel void nf12_linear_gemm_nf12(device const ushort* x [[buffer(0)]], device c
   linear_gemm(NF12Source{packed, escapes, exp_base_x4(exp_base[0])}, x, bias, y, p, tg, sg, lane, tid, sm, xoff);
 }
 
-kernel void nf12_linear_gemm_bf16t(device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],
+NF12_THREADS(32 * kGemmSimdgroups) kernel void nf12_linear_gemm_bf16t(device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],
                                    device const ushort* bias [[buffer(3)]], device ushort* y [[buffer(4)]],
                                    constant LinearParams& p [[buffer(5)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
@@ -188,7 +188,7 @@ kernel void nf12_linear_gemm_bf16t(device const ushort* x [[buffer(0)]], device 
 }
 
 #define NF12_MMA_KERNEL(MB)                                                                                        \
-  kernel void nf12_linear_mma_nf12_b##MB(                                                                          \
+  NF12_THREADS(32 * kMmaMaxSimdgroups) kernel void nf12_linear_mma_nf12_b##MB(                                                                          \
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const uint4* escapes [[buffer(2)]], device const ushort* bias [[buffer(3)]],                          \
       device ushort* y [[buffer(4)]], constant LinearParams& p [[buffer(5)]],                                      \
@@ -199,7 +199,7 @@ kernel void nf12_linear_gemm_bf16t(device const ushort* x [[buffer(0)]], device 
     linear_mma<MB>(NF12Source{packed, escapes, exp_base_x4(exp_base[0])}, x, bias, y, p, tg, sg, lane, tid,         \
                    threads.x, part);                                                                               \
   }                                                                                                                \
-  kernel void nf12_linear_mma_bf16t_b##MB(                                                                         \
+  NF12_THREADS(32 * kMmaMaxSimdgroups) kernel void nf12_linear_mma_bf16t_b##MB(                                                                         \
       device const ushort* x [[buffer(0)]], device const uint4* packed [[buffer(1)]],                              \
       device const ushort* bias [[buffer(3)]], device ushort* y [[buffer(4)]],                                     \
       constant LinearParams& p [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]],                           \

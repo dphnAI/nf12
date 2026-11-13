@@ -11,16 +11,19 @@
 //   void in(const tensor&, int)        bind an input buffer (with its offset)
 //   void out(out_t, int)               bind an output buffer
 //   template <class T> void bytes(const T&, int)  inline constant bytes
-//   void dispatch(gx, gy, gz, tx, ty, tz)          threadgroups; empty grids are skipped
+//   void dispatch(gx, gy, gz, tx, ty, tz)          threadgroups; empty grids are skipped, and a
+//                                      threadgroup over the pipeline's limit throws (ThreadgroupLimit)
 //   void barrier()                     order the next dispatch after the previous ones
 //
 // Pure C++: depends on neither torch, MLX nor Metal. Validation and allocation
-// stay in the backends; errors here are std::invalid_argument.
+// stay in the backends. Invalid arguments throw std::invalid_argument; a GPU that
+// cannot run a kernel's threadgroup throws std::runtime_error.
 #pragma once
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -34,6 +37,7 @@ constexpr uint32_t kCodecSimdgroups = 8;  // codec.metal kSimdgroups
 constexpr uint32_t kAnalyzeSuperAtomsPerSimdgroup = 16;
 constexpr uint32_t kHistWords = 3 * 128;     // codec.metal 3 * kHistBins
 constexpr uint32_t kSmallMaxSimdgroups = 16;  // linear.metal kSmallMaxSimdgroups
+constexpr uint32_t kMmaMaxSimdgroups = 8;     // linear.metal kMmaMaxSimdgroups
 constexpr int64_t kGemmBN = 64, kGemmBM = 32;  // linear_core.h
 constexpr uint32_t kGemmThreads = 128;
 constexpr int64_t kMoeMaxExperts = 1024;  // moe.metal kMaxExperts
@@ -41,6 +45,25 @@ constexpr uint32_t kAlignChunk = 256;     // moe.metal kAlignChunk
 
 inline uint64_t ceil_div(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
 inline uint64_t super_atoms(int64_t n, int64_t k) { return uint64_t(n / 16) * uint64_t(k / 64); }
+
+// Each GPU sets a per-pipeline threadgroup limit, and a dispatch above it does
+// not run (its outputs keep their previous contents). Kernels declare their
+// launch size (NF12_THREADS in nf12_metal.h), so the limit should never be
+// lower; encoders still check it before every dispatch so a GPU that disagrees
+// fails loudly instead of returning stale or zero-filled data.
+struct ThreadgroupLimit {
+  char kernel[64] = {};
+  uint64_t max_threads = 0;
+  void set(const std::string& name, uint64_t limit) {
+    std::snprintf(kernel, sizeof(kernel), "%s", name.c_str());
+    max_threads = limit;
+  }
+  void check(uint64_t threads) const {
+    if (threads > max_threads)
+      throw std::runtime_error(std::string("nf12: kernel ") + kernel + " needs " + std::to_string(threads) +
+                               " threads per threadgroup but this GPU allows " + std::to_string(max_threads));
+  }
+};
 
 template <class E>
 using out_ptr = std::remove_reference_t<typename E::out_t>*;
@@ -351,7 +374,9 @@ void launch_linear(E& e, Route route, const typename E::tensor& x, uint64_t ldx,
     p.kb_per_split = c.kb_per_split;
     p.row_blocks = c.row_blocks;
     p.splits = c.splits;
-    if (p.row_blocks * p.splits > kSmallMaxSimdgroups) throw std::invalid_argument("nf12: invalid small-M configuration");
+    // Each kernel's threadgroup partials are sized for its simdgroup maximum.
+    if (p.row_blocks * p.splits > (route == Route::kSmall ? kSmallMaxSimdgroups : kMmaMaxSimdgroups))
+      throw std::invalid_argument("nf12: invalid small-M configuration");
     gx = ceil_div(uint64_t(n / 16), p.row_blocks);
     threads = 32 * p.row_blocks * p.splits;
     if (route == Route::kSmall) {

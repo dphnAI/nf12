@@ -18,7 +18,7 @@ inline ulong simdgroup_super_atom(uint tg, uint sg) { return ulong(tg) * kSimdgr
 // fitting interval of bases starts at b, hist[1][b] those ending at b, and
 // hist[2][b] groups that collide with the sentinel at base b (see
 // reference.escape_counts_all_bases).
-kernel void nf12_encode_analyze(device const ushort* w [[buffer(0)]],
+NF12_THREADS(32 * kSimdgroups) kernel void nf12_encode_analyze(device const ushort* w [[buffer(0)]],
                                 constant ulong& ldw [[buffer(1)]],
                                 constant ulong& num_sa [[buffer(2)]],
                                 constant uint& k_blocks [[buffer(3)]],
@@ -65,7 +65,7 @@ kernel void nf12_encode_analyze(device const ushort* w [[buffer(0)]],
 }
 
 // Encode, pass 2: escaped groups per super-atom.
-kernel void nf12_encode_count(device const ushort* w [[buffer(0)]],
+NF12_THREADS(32 * kSimdgroups) kernel void nf12_encode_count(device const ushort* w [[buffer(0)]],
                               constant ulong& ldw [[buffer(1)]],
                               constant ulong& num_sa [[buffer(2)]],
                               constant uint& k_blocks [[buffer(3)]],
@@ -91,7 +91,7 @@ kernel void nf12_encode_count(device const ushort* w [[buffer(0)]],
 // Encode, pass 3: packed bytes and escapes. `offsets` is the exclusive prefix
 // sum of the per-super-atom counts, so escape indices follow flat group id
 // order (atom-major, then lane) independent of the launch grid.
-kernel void nf12_encode_write(device const ushort* w [[buffer(0)]],
+NF12_THREADS(32 * kSimdgroups) kernel void nf12_encode_write(device const ushort* w [[buffer(0)]],
                               constant ulong& ldw [[buffer(1)]],
                               constant ulong& num_sa [[buffer(2)]],
                               constant uint& k_blocks [[buffer(3)]],
@@ -128,7 +128,7 @@ kernel void nf12_encode_write(device const ushort* w [[buffer(0)]],
 // Decode to a row-major [N, K] bf16 matrix with leading dimension ldo.
 // grid.y selects the expert for stacked MoE weights (expert-local escapes and
 // exp_base, SPEC.md 9.1); dense weights use one "expert".
-kernel void nf12_decode(device const uint4* packed [[buffer(0)]],
+NF12_THREADS(32 * kSimdgroups) kernel void nf12_decode(device const uint4* packed [[buffer(0)]],
                         device const uint4* escapes [[buffer(1)]],
                         constant long* escape_offsets [[buffer(2)]],
                         device const uchar* exp_base [[buffer(3)]],
@@ -153,7 +153,7 @@ kernel void nf12_decode(device const uint4* packed [[buffer(0)]],
 }
 
 // Row-major bf16 -> bf16t twin (SPEC.md 4.4): atom j's registers at plane j.
-kernel void nf12_pack_bf16t(device const ushort* w [[buffer(0)]],
+NF12_THREADS(32 * kSimdgroups) kernel void nf12_pack_bf16t(device const ushort* w [[buffer(0)]],
                             constant ulong& ldw [[buffer(1)]],
                             constant ulong& num_sa [[buffer(2)]],
                             constant uint& k_blocks [[buffer(3)]],
@@ -202,7 +202,7 @@ inline void embedding_impl(device const uint* packed, device const uint4* escape
   dst[4] = r[2 + h];
 }
 
-kernel void nf12_embedding_i32(device const uint* packed [[buffer(0)]],
+NF12_THREADS(64) kernel void nf12_embedding_i32(device const uint* packed [[buffer(0)]],
                                device const uint4* escapes [[buffer(1)]],
                                device const uchar* exp_base [[buffer(2)]],
                                device const int* ids [[buffer(3)]],
@@ -214,7 +214,7 @@ kernel void nf12_embedding_i32(device const uint* packed [[buffer(0)]],
   embedding_impl(packed, escapes, exp_base_x4(exp_base[0]), ids, vocab, k_blocks, out, ldo, gid);
 }
 
-kernel void nf12_embedding_i64(device const uint* packed [[buffer(0)]],
+NF12_THREADS(64) kernel void nf12_embedding_i64(device const uint* packed [[buffer(0)]],
                                device const uint4* escapes [[buffer(1)]],
                                device const uchar* exp_base [[buffer(2)]],
                                device const long* ids [[buffer(3)]],
@@ -229,7 +229,7 @@ kernel void nf12_embedding_i64(device const uint* packed [[buffer(0)]],
 // Fills `count` 32-bit words with `value`. Backends whose encoders do not zero
 // new buffers (MLX) use it for the encode histograms and zero-filled outputs.
 // 256 threads per threadgroup; the index is 64-bit, so outputs may exceed 2^32 words.
-kernel void nf12_fill_u32(device uint* out [[buffer(0)]],
+NF12_THREADS(256) kernel void nf12_fill_u32(device uint* out [[buffer(0)]],
                           constant ulong& count [[buffer(1)]],
                           constant uint& value [[buffer(2)]],
                           uint tg [[threadgroup_position_in_grid]],

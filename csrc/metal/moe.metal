@@ -15,7 +15,7 @@ constant constexpr uint kMaxExperts = 1024;
 // into each chunk's first sorted position per expert (and expert_offsets),
 // pass 3 places every assignment at its chunk base plus its rank among earlier
 // same-expert assignments in the chunk. Deterministic: no order depends on atomics.
-kernel void nf12_moe_align_count(device const int* ids [[buffer(0)]],
+NF12_THREADS(kAlignChunk) kernel void nf12_moe_align_count(device const int* ids [[buffer(0)]],
                                  constant uint& num_assignments [[buffer(1)]],
                                  constant uint& num_experts [[buffer(2)]],
                                  device uint* chunk_counts [[buffer(3)]],  // [chunks, E]
@@ -35,7 +35,7 @@ kernel void nf12_moe_align_count(device const int* ids [[buffer(0)]],
 }
 
 // One threadgroup of 1024 threads.
-kernel void nf12_moe_align_offsets(constant uint& num_chunks [[buffer(0)]],
+NF12_THREADS(1024) kernel void nf12_moe_align_offsets(constant uint& num_chunks [[buffer(0)]],
                                    constant uint& num_experts [[buffer(1)]],
                                    device uint* chunk_counts [[buffer(2)]],  // in: counts, out: bases
                                    device long* expert_offsets [[buffer(3)]],
@@ -76,7 +76,7 @@ kernel void nf12_moe_align_offsets(constant uint& num_chunks [[buffer(0)]],
   }
 }
 
-kernel void nf12_moe_align_scatter(device const int* ids [[buffer(0)]],
+NF12_THREADS(kAlignChunk) kernel void nf12_moe_align_scatter(device const int* ids [[buffer(0)]],
                                    constant uint& num_assignments [[buffer(1)]],
                                    constant uint& num_experts [[buffer(2)]],
                                    device const uint* chunk_bases [[buffer(3)]],
@@ -100,7 +100,7 @@ kernel void nf12_moe_align_scatter(device const int* ids [[buffer(0)]],
 // sorted positions [start[e], start[e + 1]). Its positions form consecutive
 // tiles of at most `bm` rows, numbered expert-major. Layout: int count, three
 // pad ints, then int4 (expert, row0, rows, 0) tiles. One threadgroup of 1024.
-kernel void nf12_moe_schedule(device const long* expert_offsets [[buffer(0)]],
+NF12_THREADS(1024) kernel void nf12_moe_schedule(device const long* expert_offsets [[buffer(0)]],
                               constant uint& num_experts [[buffer(1)]],
                               constant uint& max_assignments [[buffer(2)]],
                               constant uint& bm [[buffer(3)]],
@@ -304,13 +304,13 @@ inline void moe_gemm(Experts experts, device const ushort* x, MoeRows rows, devi
       device const uchar *exp_base [[buffer(4)]]
 
 #define NF12_MOE_SMALL(MT)                                                                                       \
-  kernel void nf12_moe_small_nf12_m##MT(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS,                                       \
+  NF12_THREADS(32 * kMoeMaxSimdgroups) kernel void nf12_moe_small_nf12_m##MT(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS,                                       \
                                         uint2 threads [[threads_per_threadgroup]]) {                             \
     threadgroup float part[kMoeMaxSimdgroups * MT * 16];                                                         \
     moe_small<MT>(ExpertNF12{packed, escapes, escape_offsets, exp_base}, x, MoeRows{gather, scatter, row_scale, p}, \
                   y, schedule, p, tg, sg, lane, tid, threads.x, part);                                           \
   }                                                                                                              \
-  kernel void nf12_moe_small_bf16t_m##MT(NF12_MOE_ARGS, uint2 threads [[threads_per_threadgroup]]) {             \
+  NF12_THREADS(32 * kMoeMaxSimdgroups) kernel void nf12_moe_small_bf16t_m##MT(NF12_MOE_ARGS, uint2 threads [[threads_per_threadgroup]]) {             \
     threadgroup float part[kMoeMaxSimdgroups * MT * 16];                                                         \
     moe_small<MT>(ExpertBf16t{packed}, x, MoeRows{gather, scatter, row_scale, p}, y, schedule, p, tg, sg, lane,  \
                   tid, threads.x, part);                                                                         \
@@ -321,13 +321,13 @@ NF12_MOE_SMALL(4)
 NF12_MOE_SMALL(8)
 
 #define NF12_MOE_MMA(MB)                                                                                         \
-  kernel void nf12_moe_mma_nf12_b##MB(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS,                                         \
+  NF12_THREADS(32 * kMoeMmaMaxSimdgroups) kernel void nf12_moe_mma_nf12_b##MB(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS,                                         \
                                       uint2 threads [[threads_per_threadgroup]]) {                               \
     threadgroup float part[kMoeMmaMaxSimdgroups * 16 * 8 * MB];                                                  \
     moe_mma<MB>(ExpertNF12{packed, escapes, escape_offsets, exp_base}, x, MoeRows{gather, scatter, row_scale, p}, \
                 y, schedule, p, tg, sg, lane, tid, threads.x, part);                                             \
   }                                                                                                              \
-  kernel void nf12_moe_mma_bf16t_b##MB(NF12_MOE_ARGS, uint2 threads [[threads_per_threadgroup]]) {               \
+  NF12_THREADS(32 * kMoeMmaMaxSimdgroups) kernel void nf12_moe_mma_bf16t_b##MB(NF12_MOE_ARGS, uint2 threads [[threads_per_threadgroup]]) {               \
     threadgroup float part[kMoeMmaMaxSimdgroups * 16 * 8 * MB];                                                  \
     moe_mma<MB>(ExpertBf16t{packed}, x, MoeRows{gather, scatter, row_scale, p}, y, schedule, p, tg, sg, lane,    \
                 tid, threads.x, part);                                                                           \
@@ -336,14 +336,14 @@ NF12_MOE_MMA(1)
 NF12_MOE_MMA(2)
 NF12_MOE_MMA(4)
 
-kernel void nf12_moe_gemm_nf12(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS) {
+NF12_THREADS(32 * kGemmSimdgroups) kernel void nf12_moe_gemm_nf12(NF12_MOE_ARGS, NF12_MOE_NF12_ARGS) {
   threadgroup GemmSmem sm;
   threadgroup ulong xoff[kGemmBM];
   moe_gemm(ExpertNF12{packed, escapes, escape_offsets, exp_base}, x, MoeRows{gather, scatter, row_scale, p}, y,
            schedule, p, tg, sg, lane, tid, sm, xoff);
 }
 
-kernel void nf12_moe_gemm_bf16t(NF12_MOE_ARGS) {
+NF12_THREADS(32 * kGemmSimdgroups) kernel void nf12_moe_gemm_bf16t(NF12_MOE_ARGS) {
   threadgroup GemmSmem sm;
   threadgroup ulong xoff[kGemmBM];
   moe_gemm(ExpertBf16t{packed}, x, MoeRows{gather, scatter, row_scale, p}, y, schedule, p, tg, sg, lane, tid, sm,
@@ -352,7 +352,7 @@ kernel void nf12_moe_gemm_bf16t(NF12_MOE_ARGS) {
 
 // ---------------------------------------------------------------------------
 // moe_combine: out[t] = sum_j y[t * topk + j] in FP32, increasing j, one rounding.
-kernel void nf12_moe_combine(device const ushort* y [[buffer(0)]],
+NF12_THREADS(256) kernel void nf12_moe_combine(device const ushort* y [[buffer(0)]],
                              constant ulong& ldy [[buffer(1)]],
                              constant uint& topk [[buffer(2)]],
                              constant uint& n [[buffer(3)]],
@@ -367,7 +367,7 @@ kernel void nf12_moe_combine(device const ushort* y [[buffer(0)]],
 }
 
 // moe_silu_mul: out[r, i] = bf16(s * u), s = g / (1 + exp(-g)), all FP32 (SPEC.md 9.2).
-kernel void nf12_moe_silu_mul(device const ushort* h [[buffer(0)]],
+NF12_THREADS(256) kernel void nf12_moe_silu_mul(device const ushort* h [[buffer(0)]],
                               constant ulong& ldh [[buffer(1)]],
                               constant uint& inter [[buffer(2)]],
                               device ushort* out [[buffer(3)]],

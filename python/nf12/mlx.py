@@ -398,7 +398,7 @@ def fused_moe(x: mx.array, w13: NF12MoEWeight | mx.array, w2: NF12MoEWeight | mx
     topk_ids = _prepare_topk_ids(topk_ids, e13)
     _check_moe_input(x, k13)
     return _load().fused_moe(x, *_moe_weight_args(w13), *_moe_weight_args(w2),
-                             topk_weights.astype(mx.float32), topk_ids, expert_map is not None)
+                             topk_weights.astype(mx.float32), topk_ids)
 
 
 # ---------------------------------------------------------------------------

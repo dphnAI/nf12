@@ -288,5 +288,7 @@ def fused_moe(x: torch.Tensor, w13: NF12MoEWeight | torch.Tensor, w2: NF12MoEWei
     topk_ids = _prepare_topk_ids(topk_ids, e13)
     _check_moe_input(x, k13)
     load()
+    # Dropped assignments (id -1) always contribute zero; the op's zero_fill
+    # argument is kept for existing callers and ignored.
     return torch.ops.nf12._fused_moe(x, *_moe_weight_args(w13), *_moe_weight_args(w2),
-                                    topk_weights.float(), topk_ids, expert_map is not None)
+                                    topk_weights.float(), topk_ids)
