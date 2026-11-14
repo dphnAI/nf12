@@ -21,6 +21,7 @@ import ctypes
 import os
 
 import nf12
+import portable_random
 import pytest
 import torch
 from _helpers import bits
@@ -40,8 +41,7 @@ SHAPES = [(1024, 2048), (16 * 1031, 8192), (128, 2048)]
 
 
 def rand(*shape: int, seed: int, scale: float = 1.0) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return (torch.randn(*shape, device=DEV, generator=g) * scale).to(torch.bfloat16)
+    return portable_random.randn(*shape, seed=seed, scale=scale, device=DEV)
 
 
 def escaping_weight(n: int, k: int) -> torch.Tensor:

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import nf12
@@ -51,6 +52,7 @@ def test_header_declares_the_c_api():
     }
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="the C API (libnf12.so) is CUDA only")
 def test_exports_match_header():
     nm = shutil.which("nm")
     if nm is None:

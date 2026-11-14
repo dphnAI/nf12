@@ -13,9 +13,11 @@ from _helpers import assert_bitwise
 from nf12 import reference
 from torch import nn
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
+from _device import DEV, cuda_only, requires_gpu
+from portable_random import generator, rand, randint, randn
 
-DEV = "cuda"
+pytestmark = requires_gpu
+
 
 
 
@@ -23,21 +25,19 @@ DEV = "cuda"
 
 
 def weight(n: int, k: int, seed: int = 0, scale: float = 0.02) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return (torch.randn(n, k, device=DEV, generator=g) * scale).to(torch.bfloat16)
+    return randn(n, k, seed=seed, scale=scale, device=DEV)
 
 
 def activations(*shape: int, seed: int = 1) -> torch.Tensor:
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    return torch.randn(*shape, device=DEV, generator=g).to(torch.bfloat16)
+    return randn(*shape, seed=seed, device=DEV)
 
 
 def special_weight(n: int, k: int) -> torch.Tensor:
     """Random bit patterns plus every class the format must preserve."""
-    g = torch.Generator(device=DEV).manual_seed(7)
+    g = generator(7)
     w = weight(n, k, seed=3)
-    raw = torch.randint(-32768, 32768, (n, k), device=DEV, generator=g, dtype=torch.int32).to(torch.int16)
-    w = torch.where(torch.rand(n, k, device=DEV, generator=g) < 0.05, raw.view(torch.bfloat16), w)
+    raw = randint(-32768, 32768, (n, k), seed=g, dtype=torch.int32, device=DEV).to(torch.int16)
+    w = torch.where(rand(n, k, seed=g, device=DEV) < 0.05, raw.view(torch.bfloat16), w)
     flat = w.view(-1).view(torch.int16)
     specials = torch.tensor(
         [0x0000, -0x8000, 0x0001, -0x7FFF, 0x007F, 0x7F80, -0x0080, 0x7FC0, 0x7F81, -0x0001, 0x7F7F, 0x0080],
@@ -60,6 +60,9 @@ def _route_query():
 def torch_op_routes(m: int, n: int, k: int) -> bool:
     """Whether nf12.linear takes the decode + cuBLAS route at (m, n, k) on this device. Its output matches
     the same cuBLAS calls on decode(W) (tests/api/test_decode_route.py), not the bf16t twin (SPEC.md 6.5)."""
+    if DEV == "mps":
+        nf12.load()
+        return torch.ops.nf12._mps_decode_gemm_rows(m, n, k) > 0
     return _route_query()(m, n, k, torch.cuda.current_device()) > 0
 
 
@@ -208,14 +211,14 @@ def test_errors():
         nf12.encode(weight(16, 96))
     with pytest.raises(ValueError, match="bfloat16"):
         nf12.encode(weight(16, 64).float())
-    with pytest.raises(ValueError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA|MPS"):
         nf12.encode(weight(16, 64).cpu())
     nw = nf12.encode(weight(16, 64))
     with pytest.raises(ValueError, match=r"\[\.\.\., 64\]"):
         nf12.linear(activations(2, 128), nw)
     with pytest.raises(ValueError, match="bfloat16"):
         nf12.linear(activations(2, 64).half(), nw)
-    with pytest.raises(ValueError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA|MPS"):
         nf12.linear(activations(2, 64).cpu(), nw)
     with pytest.raises(RuntimeError, match="bias"):
         nf12.linear(activations(2, 64), nw, torch.zeros(8, dtype=torch.bfloat16, device=DEV))
@@ -244,8 +247,8 @@ def test_opcheck():
 
 
 def make_linear(k: int, n: int, bias: bool = True, seed: int = 0) -> nn.Linear:
-    torch.manual_seed(seed)
-    return nn.Linear(k, n, bias=bias, device=DEV, dtype=torch.bfloat16)
+    torch.manual_seed(seed)  # CPU initialization (uniform draws) is portable; device initialization is not
+    return nn.Linear(k, n, bias=bias, dtype=torch.bfloat16).to(DEV)
 
 
 @pytest.mark.parametrize("bias", [True, False])
@@ -298,7 +301,7 @@ def test_module_state_dict_safetensors(tmp_path):
     fresh = nn.Sequential(nf12.NF12Linear(256, 128, device=DEV), nn.GELU(),
                           nf12.NF12Linear(128, 64, bias=False, device=DEV))
     fresh.load_state_dict(loaded)
-    assert fresh[0].nf12_packed.device.type == "cuda"
+    assert fresh[0].nf12_packed.device.type == DEV
     x = activations(5, 256)
     with torch.no_grad():
         assert_bitwise(fresh(x), model(x))
@@ -326,6 +329,7 @@ def test_module_state_dict_safetensors(tmp_path):
     (512, 128, 2048), (513, 128, 2048),
     (192, 128, 4096), (193, 128, 4096),
 ])
+@cuda_only
 def test_cuda_graph_capture_replay(m, n, k):
     nw = nf12.encode(weight(n, k))
     bias = activations(n)
@@ -384,7 +388,22 @@ def test_torch_compile_functional(static_weights):
     assert_bitwise(f(x), nf12.linear(x, nw, static_weights=static_weights) * 2)
 
 
+def test_mps_library_requires_its_torch_version(tmp_path):
+    """libnf12_mps.dylib uses PyTorch internals: a packaged copy is used only under
+    the torch version recorded at build time (otherwise nf12 builds a matching one)."""
+    from nf12._library import built_for_this_torch
+
+    lib = tmp_path / "libnf12_mps.dylib"
+    lib.touch()
+    assert not built_for_this_torch(lib)  # no record
+    (tmp_path / "libnf12_mps.torch_version").write_text(torch.__version__ + "\n")
+    assert built_for_this_torch(lib)
+    (tmp_path / "libnf12_mps.torch_version").write_text("2.10.0\n" if torch.__version__ != "2.10.0" else "2.11.0\n")
+    assert not built_for_this_torch(lib)
+    assert built_for_this_torch(tmp_path / "libnf12_torch.so")  # CUDA: torch stable ABI, any torch >= 2.10
+
 @pytest.mark.parametrize("magnitude,bias_value", [(2.**25, 1.), (1., 2.**-25), (2.**127, 2.**127)])
+@cuda_only
 def test_split_k_bias_follows_complete_reduction(dense_ops, magnitude, bias_value):
     m, n, k = 16, 16, 512
     w = torch.zeros((n, k), device="cuda", dtype=torch.bfloat16)
