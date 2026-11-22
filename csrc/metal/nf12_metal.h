@@ -6,7 +6,7 @@
 //   R0 = (row g,     cols 2t, 2t+1)    R2 = (row g,     cols 2t+8, 2t+9)
 //   R1 = (row g + 8, cols 2t, 2t+1)    R3 = (row g + 8, cols 2t+8, 2t+9)
 // of atom j (columns 16j..16j+15) of a 16 x 64 super-atom.
-// Kernels are compiled with -fno-fast-math (SPEC.md section 6).
+// Kernels are compiled with fast math disabled (SPEC.md section 6).
 #pragma once
 
 #include <metal_stdlib>
@@ -26,6 +26,16 @@ constant constexpr uint kMaxExpBase = 120;
 // (launch.h also checks maxTotalThreadsPerThreadgroup before each dispatch).
 #define NF12_THREADS(n) [[max_total_threads_per_threadgroup(n)]]
 
+struct LinearParams {
+  ulong ldx, ldy;
+  uint m, n, k_blocks;
+  uint kb_per_split;
+  uint row_blocks;
+  uint splits;
+  uint has_bias;
+  uint reserved;
+};
+
 struct Group {
   uint meta, lo0, lo1;
 };
@@ -42,6 +52,12 @@ inline ushort float_to_bf16(float f) {
   return ushort((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 inline uint pack_bf16x2(float lo, float hi) { return uint(float_to_bf16(lo)) | (uint(float_to_bf16(hi)) << 16); }
+
+inline void store_linear(device ushort* y, device const ushort* bias, constant LinearParams& p,
+                         uint m, uint n, float sum) {
+  if (p.has_bias) sum += bf16_to_float(bias[n]);
+  y[ulong(m) * p.ldy + n] = float_to_bf16(sum);
+}
 
 // ---------------------------------------------------------------------------
 // Group decode (SPEC.md section 3). Byte j of a/b is hi(s(2j)) / hi(s(2j+1)).
@@ -119,6 +135,20 @@ inline void store_atom(device ushort* w, ulong off, ulong ld, uint j, const thre
   *reinterpret_cast<device uint*>(p + 8 * ld) = r[1];
   *reinterpret_cast<device uint*>(p + 8) = r[2];
   *reinterpret_cast<device uint*>(p + 8 * ld + 8) = r[3];
+}
+
+// Stage a decoded 16 x 64 tile in BF16 pairs, with a stride of Ld elements.
+template <uint Ld>
+inline void stage_bf16_tile(threadgroup uint* tile, uint lane, const thread uint (&r)[4][4]) {
+  threadgroup uint* w0 = tile + (lane >> 2) * (Ld / 2) + (lane & 3u);
+  threadgroup uint* w1 = w0 + 8 * (Ld / 2);
+  #pragma unroll
+  for (uint j = 0; j < 4; ++j) {
+    w0[8 * j] = r[j][0];
+    w0[8 * j + 4] = r[j][2];
+    w1[8 * j] = r[j][1];
+    w1[8 * j + 4] = r[j][3];
+  }
 }
 
 // ---------------------------------------------------------------------------

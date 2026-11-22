@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // torch.ops.nf12 on Apple GPUs (MPS). The schemas match csrc/torch/ops.cpp, so
-// the Python API is unchanged. Kernels live in nf12.metallib (csrc/metal/*.metal)
+// the Python API is unchanged. Kernels are compiled by Metal on first use
 // and are encoded on PyTorch's current MPS stream through its shared compute
 // encoder, so they order with surrounding torch work without extra syncs.
 #include <ATen/ATen.h>
@@ -10,7 +10,6 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#include <dlfcn.h>
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +24,7 @@
 #include <vector>
 
 #include "launch.h"
+#include "shader_library.h"
 
 namespace nf12_mps {
 namespace {
@@ -35,32 +35,20 @@ using namespace nf12::metal;
 // ---------------------------------------------------------------------------
 // Metal library and pipelines.
 
-std::string metallib_path() {
-  if (const char* env = std::getenv("NF12_METALLIB"); env != nullptr && *env != '\0') return env;
-  Dl_info info{};
-  TORCH_CHECK(dladdr(reinterpret_cast<const void*>(&metallib_path), &info) != 0 && info.dli_fname != nullptr,
-              "nf12: cannot locate libnf12_mps");
-  std::string path(info.dli_fname);
-  return path.substr(0, path.find_last_of('/') + 1) + "nf12.metallib";
-}
-
 id<MTLDevice> mtl_device() { return at::mps::getCurrentMPSStream()->device(); }
 
 id<MTLComputePipelineState> pipeline(const char* name) {
   static std::mutex mu;
   static id<MTLLibrary> library = nil;
+  static id<MTLLibrary> tensor_library = nil;
   static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
   std::lock_guard<std::mutex> lock(mu);
   if (auto it = cache.find(name); it != cache.end()) return it->second;
-  if (library == nil) {
-    const std::string path = metallib_path();
-    NSError* error = nil;
-    library = [mtl_device() newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
-    TORCH_CHECK(library != nil, "nf12: failed to load ", path, ": ",
-                error ? [[error localizedDescription] UTF8String] : "unknown error");
-  }
-  id<MTLFunction> fn = [library newFunctionWithName:@(name)];
-  TORCH_CHECK(fn != nil, "nf12: kernel ", name, " not found in nf12.metallib");
+  const bool tensor = is_tensor_kernel(name);
+  id<MTLLibrary>& lib = tensor ? tensor_library : library;
+  if (lib == nil) lib = static_cast<id<MTLLibrary>>(new_shader_library(mtl_device(), tensor));
+  id<MTLFunction> fn = [lib newFunctionWithName:@(name)];
+  TORCH_CHECK(fn != nil, "nf12: kernel ", name, " not found in the Metal library");
   NSError* error = nil;
   id<MTLComputePipelineState> pso = [mtl_device() newComputePipelineStateWithFunction:fn error:&error];
   [fn release];
@@ -292,6 +280,11 @@ void decode_gemm(const WeightView& w, const Tensor& x2, const std::optional<Tens
   }
 }
 
+Route dense_linear_route(int64_t m, int64_t n, int64_t k, bool nf12) {
+  static const bool tensor = supports_tensor_linear(mtl_device());
+  return linear_route(m, n, k, nf12, tensor, LinearBackend::kMps);
+}
+
 // `nf12_view` is null for bf16t weights.
 Tensor run_linear(const Tensor& x, const Tensor& packed, int64_t n, int64_t k, const std::optional<Tensor>& bias_in,
                   const char* op, const WeightView* nf12_view) {
@@ -304,7 +297,7 @@ Tensor run_linear(const Tensor& x, const Tensor& packed, int64_t n, int64_t k, c
   Tensor y = at::empty(out_sizes, x.options());
   if (m == 0) return y;
   TORCH_CHECK(m <= INT32_MAX, "nf12.", op, ": too many rows");
-  const Tensor x2 = pair_rows(x.reshape({m, k}));
+  Tensor x2 = pair_rows(x.reshape({m, k}));
   std::optional<Tensor> bias;
   if (bias_in.has_value()) {
     check_mps(*bias_in, "bias");
@@ -314,7 +307,8 @@ Tensor run_linear(const Tensor& x, const Tensor& packed, int64_t n, int64_t k, c
   }
   Tensor y2 = y.view({m, n});
   const bool nf12 = nf12_view != nullptr;
-  const Route route = linear_route(m, nf12);
+  const Route route = dense_linear_route(m, n, k, nf12);
+  if (route == Route::kTensor && row_stride(x2) > INT32_MAX) x2 = x2.contiguous();
   if (route == Route::kDecode) {
     decode_gemm(*nf12_view, x2, bias, y2);
   } else {
@@ -330,7 +324,7 @@ Tensor run_linear(const Tensor& x, const Tensor& packed, int64_t n, int64_t k, c
 // for the fused kernels (the MPS counterpart of nf12_linear_decode_gemm_rows).
 int64_t decode_gemm_rows(int64_t m, int64_t n, int64_t k) {
   check_shape(n, k, "decode_gemm_rows");
-  if (m <= 0 || linear_route(m, true) != Route::kDecode) return 0;
+  if (m <= 0 || dense_linear_route(m, n, k, true) != Route::kDecode) return 0;
   return decode_slice_rows(n, k);
 }
 

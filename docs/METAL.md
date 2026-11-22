@@ -9,9 +9,9 @@ On macOS, nf12 builds a Metal backend instead of CUDA, for two frameworks:
   arrays, and `mlx.nn` modules `NF12Linear` and `NF12Embedding`). `import nf12.mlx`
   does not import PyTorch.
 
-Both frameworks run the same kernels (`nf12.metallib`) through the same host launch
-code, so MLX and MPS results are bit-identical. The encoded format (docs/SPEC.md) is
-byte-for-byte the same as on CUDA, so weights move freely between all three.
+Both frameworks share the Metal shaders and launch code. A matching fused
+route gives bit-identical results. The encoded format (docs/SPEC.md) is byte-for-byte
+the same as on CUDA, so weights move freely between all three.
 
 ```python
 import mlx.core as mx
@@ -43,12 +43,8 @@ needs all three of a weight's tensors in one `load_state_dict` call.
 ## Requirements
 
 - Apple Silicon Mac, macOS 14 or newer.
-- Full Xcode with the Metal Toolchain component:
-  ```bash
-  sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-  xcodebuild -downloadComponent MetalToolchain
-  xcrun metal --version   # must print a version, not "missing Metal Toolchain"
-  ```
+- Apple Command Line Tools for source or first-use native builds (`xcode-select
+  --install`). Metal compiles the embedded shaders on the first GPU operation.
 - CMake 3.26+, Ninja, uv, Python 3.10+ and PyTorch 2.10+ with MPS.
 - For MLX: MLX 0.32+ and the nanobind version MLX was built with (3.1.0 for MLX
   0.32), installed by the `mlx` extra.
@@ -56,7 +52,7 @@ needs all three of a weight's tensors in one `load_state_dict` call.
 ## Build
 
 ```bash
-uv sync --locked --group test --extra mlx  # nf12.metallib, libnf12_mps.dylib, nf12/_mlx_ext*.so
+uv sync --locked --group test --extra mlx  # libnf12_mps.dylib and nf12/_mlx_ext*.so
 NF12_BUILD_NATIVE=OFF uv sync --locked      # or defer the build to first use (python/nf12/_jit.py)
 ```
 
@@ -67,7 +63,7 @@ it, `OFF` skips it. For a standalone build:
 
 ```bash
 cmake -S . -B build/metal -G Ninja -DPython_EXECUTABLE=$PWD/.venv/bin/python
-cmake --build build/metal   # build/metal/{nf12.metallib,libnf12_mps.dylib,_mlx_ext*.so}
+cmake --build build/metal   # build/metal/{libnf12_mps.dylib,_mlx_ext*.so}
 ```
 
 `LDFLAGS`/`CPPFLAGS` that point at a non-Apple LLVM (for example
@@ -99,12 +95,14 @@ A macOS wheel is CPython specific because of the MLX module.
 | `csrc/metal/linear_core.h` | Fused decode + multiply cores shared by dense and MoE kernels |
 | `csrc/metal/codec.metal` | Encode (analyze, count, write), decode (dense and stacked experts), bf16t packing, embedding |
 | `csrc/metal/linear.metal` | Dense `linear` / `linear_bf16t` kernels |
+| `csrc/metal/linear_tensor.metal` | Metal 4 TensorOps dense prefill kernels |
 | `csrc/metal/moe.metal` | `moe_align`, tile schedule, grouped linear, `moe_combine`, `moe_silu_mul` |
 | `csrc/metal/launch.h` | Host ABI shared by both frameworks: kernel names, buffer indices, parameter structs, grid geometry, routing |
 | `csrc/metal/ops_mps.mm` | `torch.ops.nf12` schemas and MPS implementations |
 | `csrc/mlx/nf12_mlx.cpp` | MLX primitives and the `nf12._mlx_ext` nanobind module |
 | `python/nf12/mlx.py` | MLX Python API and `mlx.nn` modules |
-| `cmake/Metal.cmake` | `xcrun metal` → `nf12.metallib`; Objective-C++ → `libnf12_mps.dylib`; nanobind → `_mlx_ext` |
+| `csrc/metal/shader_library.mm` | Loads or compiles the Metal shader library shared by both extensions |
+| `cmake/Metal.cmake` | Builds the MPS and MLX extensions with embedded shader source |
 
 Each `launch_*` function in `launch.h` is written once against a small encoder
 interface (`pipeline`, `in`, `out`, `bytes`, `dispatch`, `barrier`), as in
@@ -120,7 +118,8 @@ QuixiCore-Metal's `tk_launch.h`. The two adapters are:
   that write a buffer twice (zeroing, then accumulating) call `barrier()`, which is a
   no-op on PyTorch's serial encoder.
 
-`NF12_METALLIB` overrides the metallib location (default: next to the extension).
+`NF12_METALLIB` can point to a compatible precompiled shader library. By default,
+each backend compiles the required embedded libraries on first use.
 
 ## Kernels
 
@@ -134,16 +133,19 @@ its four groups of a super-atom, exactly as on CUDA.
   `nf12.reference.encode`.
 - **Small M (scalar)**: one simdgroup streams the super-atoms of a 16-row block,
   decoding in registers and accumulating rows `g` and `g + 8` per lane in FP32.
-  K is split across simdgroups; partials are summed in a fixed order.
+  When K is split across simdgroups, partials are summed in a fixed order.
+  Without a split, each simdgroup writes its result directly.
 - **Medium M (register MMA)**: Apple's 8x8 `simdgroup_matrix` fragment gives lane `l`
   the pair `(fm, fn), (fm, fn + 1)`. A decoded NF12 register is a bf16 pair of an
   8x8 quarter of an atom, so each A fragment is one `simd_shuffle` from lane
-  `4 fm + fn / 2`; activations load straight into B fragments. No threadgroup staging.
-- **Large M (GEMM)**: a 64-row weight tile is decoded to threadgroup memory (FP32,
-  exact) and multiplied with `simdgroup_float8x8`. Used for bf16t and MoE at large T.
-- **Decode-then-GEMM** (SPEC.md 6.5): NF12 `linear` at large M decodes 16 MiB row
-  slices (small enough to stay cache resident) and multiplies with torch's MPS matmul.
-  MLX decodes the whole weight and uses `mx.matmul`/`mx.addmm`.
+  `4 fm + fn / 2`; activations load straight into B fragments. Threadgroup memory
+  is used only to combine split-K partials.
+- **Fused GEMM**: a 64-row weight tile is decoded into threadgroup memory.
+  Dense linear stages BF16 operands and MoE stages FP32 operands. Both
+  accumulate in FP32.
+- **Decode-then-GEMM** (SPEC.md 6.5): NF12 `linear` at large M decodes row slices
+  of up to 64 MiB by default, then calls the framework's BF16 matmul or addmm
+  on each slice.
 - **MoE**: `moe_align` is a deterministic stable counting sort (chunk counts, chunk
   bases, in-chunk ranks; a stable device sort above 1024 experts). A one-threadgroup
   schedule turns device-side expert offsets into tiles sized to the expected rows
@@ -152,21 +154,26 @@ its four groups of a super-atom, exactly as on CUDA.
 
 ## Numerics
 
-The contract of SPEC.md section 6 holds: `-fno-fast-math`, FP32 accumulation, one
+The kernels disable fast math and follow SPEC.md section 6: FP32 accumulation, one
 BF16 round-to-nearest-even, fixed reduction orders, and a single kernel template
 per route for both weight sources, so NF12 output is bit-identical to the bf16t twin
-on every fused route, and MLX output is bit-identical to MPS output. The
-decode-then-GEMM route matches the framework's matmul on the decoded weight
-instead (as on CUDA).
+on every fused route. MLX and MPS outputs are bit-identical when both use
+the same fused route. Each framework's decode-then-GEMM route matches its own
+matmul on the decoded weight (as on CUDA).
 
 ## Routing
 
-Routes depend only on shapes. Thresholds were measured on an M5 Max:
+Outside the prefill cases below, linear uses scalar kernels up to 4 tokens and
+register MMA up to 16. Larger inputs use decode-then-GEMM for NF12 or fused GEMM
+for bf16t. MoE uses scalar kernels up to 4 expected rows per expert and register
+MMA up to 8, then fused GEMM.
 
-| op | route |
-|---|---|
-| `linear`, `linear_bf16t` | M <= 4 scalar; M <= 16 register MMA; larger M: NF12 decode-then-GEMM, bf16t fused GEMM |
-| `moe_linear` (expected rows per expert r) | r <= 4 scalar; r <= 8 register MMA; larger: fused GEMM |
+- At 17–32 tokens, both backends use fused GEMM for `N >= 4096` and
+  `2048 <= K <= 16384`. MLX also uses it for `N >= 512` and
+  `2048 <= K <= 4096`.
+- On macOS 27 or later with Apple10 GPU support, Metal 4.1 TensorOps handles
+  selected dense shapes at 16–128 tokens. Long reductions use ordered split-K.
+  Explicit route overrides and `NF12_METALLIB` select the standard kernels.
 
 `NF12_MPS_LINEAR=small|mma|gemm|decode` and `NF12_MPS_MOE=small|mma|gemm` force a
 route for both frameworks (tests run the suites under each; the MLX tests set them
@@ -234,8 +241,7 @@ machine and device. A new test should fail on the code it guards; check that by
 running it against the unfixed code.
 
 Bit-exact assertions are only made where nf12's code fixes the arithmetic order:
-nf12's own kernels (routes depend on shapes and environment variables, never on
-the GPU, and the shaders build with `-fno-fast-math`), or the same framework call
+nf12's own kernels under the same configuration with fast math disabled, or the same framework call
 at the same shape on the same inputs. The decode route's GEMM belongs to the
 framework (MPS or MLX), which chooses its kernel by GPU and shape, so it is
 compared with a tolerance against anything else. A bit-exact pass on one Apple GPU
@@ -244,9 +250,6 @@ Apple GPU generation when one is available.
 
 ## Limitations and next steps
 
-- Medium and large M are bounded by FP32 `simdgroup_matrix` throughput. Metal 4
-  tensor operations (the M5 GPU's matrix units) for the decoded tiles are the next
-  step for M > 16 and for MoE prefill.
 - Small-T MoE runs 9 dispatches (align, schedule, two grouped linears, SiLU-mul,
   combine); fusing align with the schedule and SiLU-mul into the w13 epilogue, as
   CUDA's single-token route does, would cut most of the remaining overhead.

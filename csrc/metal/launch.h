@@ -7,7 +7,7 @@
 //
 //   E::tensor                          backend array type (at::Tensor, mx::array)
 //   E::out_t                           output handle type (a reference)
-//   void pipeline(const std::string&)  select a kernel from nf12.metallib
+//   void pipeline(const std::string&)  select a kernel from the Metal library
 //   void in(const tensor&, int)        bind an input buffer (with its offset)
 //   void out(out_t, int)               bind an output buffer
 //   template <class T> void bytes(const T&, int)  inline constant bytes
@@ -71,11 +71,11 @@ using out_ptr = std::remove_reference_t<typename E::out_t>*;
 // ---------------------------------------------------------------------------
 // Parameter structs (must match the .metal declarations).
 
-struct LinearParams {  // linear.metal LinearParams
+struct LinearParams {  // nf12_metal.h LinearParams
   uint64_t ldx, ldy;
   uint32_t m, n, k_blocks, kb_per_split, row_blocks, splits, has_bias, reserved;
 };
-static_assert(sizeof(LinearParams) == 48, "LinearParams layout must match linear.metal");
+static_assert(sizeof(LinearParams) == 48, "LinearParams layout must match nf12_metal.h");
 
 struct MoeParams {  // moe.metal MoeParams
   uint64_t ldx, ldy, expert_super_atoms;
@@ -84,12 +84,31 @@ struct MoeParams {  // moe.metal MoeParams
 static_assert(sizeof(MoeParams) == 64, "MoeParams layout must match moe.metal");
 
 // ---------------------------------------------------------------------------
-// Routing. Routes depend only on shapes (SPEC.md 6.5, 9.3).
+// Routing. Routes depend on shapes and architecture (SPEC.md 6.5, 9.3).
 
-enum class Route { kSmall, kMma, kGemm, kDecode };
+enum class Route { kSmall, kMma, kGemm, kDecode, kTensor };
+enum class LinearBackend { kMps, kMlx };
+
+// Metal 4 TensorOps tiles. Each simdgroup owns 16 output columns. Longer
+// reductions split K within a threadgroup to keep more of the GPU occupied.
+struct TensorConfig {
+  uint32_t tokens;
+  uint32_t splits;
+};
+inline TensorConfig tensor_config(int64_t m, int64_t k) {
+  return {m < 32 ? 16u : m < 64 ? 32u : 64u, k > 4096 ? 4u : 1u};
+}
+
+inline bool tensor_prefill(int64_t m, int64_t n, int64_t k) {
+  if (m < 16 || m > 128 || n < 512 || k < 2048 || k > 16384) return false;
+  if (n < 4096)
+    return k <= 4096 && (m == 16 || m == 32 || m == 64 || (n <= 1024 && m > 64));
+  if (n > 32768) return m == 16 || (m >= 32 && m <= 64);
+  return true;
+}
 
 // NF12_MPS_LINEAR=small|mma|gemm|decode forces a route (decode needs NF12) for testing.
-inline Route linear_route(int64_t m, bool nf12) {
+inline Route linear_route(int64_t m, int64_t n, int64_t k, bool nf12, bool tensor, LinearBackend backend) {
   if (const char* env = std::getenv("NF12_MPS_LINEAR"); env != nullptr && *env != '\0') {
     const std::string s(env);
     if (s == "small") return Route::kSmall;
@@ -98,12 +117,22 @@ inline Route linear_route(int64_t m, bool nf12) {
     if (s == "decode") return nf12 ? Route::kDecode : Route::kGemm;
     throw std::invalid_argument("nf12: NF12_MPS_LINEAR must be small, mma, gemm or decode, got " + s);
   }
+  const bool mlx = backend == LinearBackend::kMlx;
+  const bool short_prefill = m > 16 && m <= kGemmBM && k >= 2048;
+  const bool wide_fused = short_prefill && n >= 4096 && k <= 16384;
+  // MPS decode-GEMM is competitive on narrower projections.
+  const bool prefer_tensor = mlx || (n >= 4096 && (n >= 8192 || k > 4096 || wide_fused));
+  if (tensor && prefer_tensor && tensor_prefill(m, n, k)) {
+    const char* lib = std::getenv("NF12_METALLIB");
+    if (lib == nullptr || *lib == '\0') return Route::kTensor;
+  }
   // Measured on an M5 Max (14336 x 4096 and 4096 x 14336): the scalar GEMV
   // streams NF12 at DRAM bandwidth to M = 4, the register-MMA kernel to M = 16;
   // beyond that matmul is compute bound and BF16 matmul on decoded slices wins.
   if (m <= 4) return Route::kSmall;
   if (m <= 16) return Route::kMma;
-  return nf12 ? Route::kDecode : Route::kGemm;
+  const bool fused = wide_fused || (mlx && short_prefill && n >= 512 && k <= 4096);
+  return nf12 && !fused ? Route::kDecode : Route::kGemm;
 }
 
 inline uint32_t small_mt(int64_t m) { return m <= 1 ? 1 : m <= 2 ? 2 : m <= 4 ? 4 : 8; }
@@ -123,12 +152,12 @@ inline SmallConfig small_config(int64_t n, int64_t k, uint32_t simdgroups = 8) {
           splits};
 }
 
-// Decode-then-GEMM slice size: decoded BF16 slices of at most 16 MiB stay cache
-// resident for the matmul (NF12_MPS_DECODE_SLICE_MB overrides).
+// Decode-then-GEMM slice size: decoded BF16 slices are capped at 64 MiB
+// by default (NF12_MPS_DECODE_SLICE_MB overrides).
 inline int64_t decode_slice_bytes() {
   if (const char* env = std::getenv("NF12_MPS_DECODE_SLICE_MB"); env != nullptr && *env != '\0')
     return std::max<int64_t>(1, std::atoll(env)) << 20;
-  return int64_t(16) << 20;
+  return int64_t(64) << 20;
 }
 inline int64_t decode_slice_rows(int64_t n, int64_t k) {
   return std::min(n, std::max<int64_t>(16, (decode_slice_bytes() / (k * 2)) / 16 * 16));
@@ -350,7 +379,7 @@ void launch_embedding(E& e, const typename E::tensor& packed, const typename E::
   e.dispatch(ceil_div(x_threads, tx), num_ids, 1, tx, 1, 1);
 }
 
-// Fused linear (route kSmall, kMma or kGemm): y [m, n] (row stride n) =
+// Fused linear: y [m, n] (row stride n) =
 // x [m, k] (row stride ldx, even, 4-byte aligned) @ W.T (+ bias).
 // NF12 weights pass `nf12 = true`, their escapes (null when none) and exp_base;
 // bf16t twins pass `nf12 = false`.
@@ -388,6 +417,15 @@ void launch_linear(E& e, Route route, const typename E::tensor& x, uint64_t ldx,
       kernel = "nf12_linear_mma_" + src + "_b" + std::to_string(mb);
       gy = ceil_div(uint64_t(m), 8 * mb);
     }
+  } else if (route == Route::kTensor) {
+    const auto [tokens, splits] = tensor_config(m, k);
+    constexpr uint32_t simdgroups = 4;
+    kernel = "nf12_linear_tensor_" + src + "_m" + std::to_string(tokens) + "_s" + std::to_string(splits);
+    gx = ceil_div(uint64_t(n / 16), simdgroups / splits);
+    gy = ceil_div(uint64_t(m), tokens);
+    threads = 32 * simdgroups;
+    p.splits = splits;
+    p.kb_per_split = uint32_t(ceil_div(p.k_blocks, splits));
   } else {
     kernel = "nf12_linear_gemm_" + src;
     gx = ceil_div(uint64_t(n), kGemmBN);

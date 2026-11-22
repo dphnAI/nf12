@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLX backend (nf12.mlx): byte-exact codec against nf12.reference, NF12 ==
 bf16t twin on the fused routes, and bit parity with the PyTorch MPS backend,
-which runs the same nf12.metallib kernels through the same launch code."""
+which runs the same Metal kernels through the same launch code."""
 
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import sys
+from platform import mac_ver
 
 import numpy as np
 import pytest
@@ -163,6 +165,101 @@ def test_linear_parity_with_mps(monkeypatch, route, m):
     assert_bitwise(nm.linear(x, nm.encode(w), bias), expected.cpu())
     expected_t = nf12.linear_bf16t(to_torch(x, "mps"), nf12.pack_bf16t(to_torch(w, "mps")), to_torch(bias, "mps"))
     assert_bitwise(nm.linear_bf16t(x, nm.pack_bf16t(w), bias), expected_t.cpu())
+
+
+@pytest.mark.parametrize("m", [4, 7, 16])
+@pytest.mark.parametrize("k", [192, 320])
+def test_linear_tail_matches_the_twin(m, k):
+    # 33 output blocks leave a tail with and without splitting K. Include
+    # escapes and use the same accumulation configuration for the BF16 twin.
+    n = 528
+    w = matrix(n, k, seed=m)
+    x = activations(m, k, seed=k)
+    nw, twin = nm.encode(w), nm.pack_bf16t(w)
+    actual = nm.linear(x, nw)
+    close_to_reference(actual, x, w)
+    assert_bitwise(actual, nm.linear_bf16t(x, twin))
+
+
+@pytest.mark.parametrize("m,n,k,override,fused", [
+    (17, 528, 2048, None, True),
+    (32, 528, 4096, None, True),
+    (33, 528, 2048, None, False),
+    (17, 496, 2048, None, False),
+    (17, 528, 1984, None, False),
+    (17, 528, 4160, None, False),
+    (32, 4096, 8192, None, True),
+    (17, 4080, 4160, None, False),
+    (32, 4096, 16448, None, False),
+    (17, 528, 2048, "decode", False),
+])
+def test_mlx_short_prefill_route(monkeypatch, m, n, k, override, fused):
+    if override is None:
+        monkeypatch.delenv("NF12_MPS_LINEAR", raising=False)
+    else:
+        monkeypatch.setenv("NF12_MPS_LINEAR", override)
+    w = matrix(n, k, seed=m, escapes=False)
+    w[-1, -1] = 16.0
+    nw = nm.encode(w)
+    x, bias = activations(m, k), activations(n, seed=5)
+    y = nm.linear(x, nw, bias)
+    if fused:
+        assert_bitwise(y, nm.linear_bf16t(x, nm.pack_bf16t(w), bias))
+        close_to_reference(y, x, w, bias)
+    else:
+        assert_bitwise(y, mx.addmm(bias, x, w.T))
+
+
+@pytest.fixture(scope="module")
+def accelerated_tensor_gpu():
+    if sys.platform != "darwin" or int(mac_ver()[0].split(".")[0]) < 27:
+        pytest.skip("Metal 4.1 requires macOS 27 or later")
+    # Query the OS directly so a broken NF12 gate cannot skip this test.
+    metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+    objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+    metal.MTLCreateSystemDefaultDevice.argtypes = ()
+    metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = (ctypes.c_char_p,)
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)
+    objc.objc_msgSend.restype = ctypes.c_bool
+    objc.objc_release.argtypes = (ctypes.c_void_p,)
+    objc.objc_release.restype = None
+    device = metal.MTLCreateSystemDefaultDevice()
+    try:
+        family_apple10 = 1010
+        selector = objc.sel_registerName(b"supportsFamily:")
+        if not objc.objc_msgSend(device, selector, family_apple10):
+            pytest.skip("Metal Apple10 family capability required")
+    finally:
+        objc.objc_release(device)
+
+
+@requires_mps
+@pytest.mark.parametrize("m,n,k,has_bias", [
+    (32, 4112, 2048, True),
+    (31, 4112, 4160, False),
+    (65, 4096, 4160, True),
+])
+def test_tensor_prefill_matches_twin_and_mps(accelerated_tensor_gpu, monkeypatch, m, n, k, has_bias):
+    monkeypatch.delenv("NF12_MPS_LINEAR", raising=False)
+    monkeypatch.delenv("NF12_METALLIB", raising=False)
+    w = matrix(n, k, escapes=False)
+    w[-1, -1] = 16.0
+    nw = nm.encode(w)
+    assert nw.escapes.shape[0] > 0
+    padded = activations(m, k + 64)
+    x = padded[:, 32:32 + k]
+    bias = activations(n, seed=5) if has_bias else None
+    y = nm.linear(x, nw, bias)
+    assert_bitwise(y, nm.linear_bf16t(x, nm.pack_bf16t(w), bias))
+    close_to_reference(y, x, w, bias)
+
+    tw = nf12.encode(to_torch(w, "mps"))
+    tx = to_torch(padded, "mps")[:, 32:32 + k]
+    tb = None if bias is None else to_torch(bias, "mps")
+    assert torch.ops.nf12._mps_decode_gemm_rows(m, n, k) == 0
+    assert_bitwise(y, nf12.linear(tx, tw, tb).cpu())
 
 
 def test_linear_leading_dims_and_empty():
